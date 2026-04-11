@@ -30,11 +30,47 @@ def u16le(buf: bytes, off: int):
     return int.from_bytes(buf[off:off+2], 'little', signed=False)
 
 FLOWMETER_TYPES = {0:'unknown',1:'impulse_1l',2:'impulse_10l',3:'dual_channel',4:'electronic',5:'fixed',6:'reed_switch'}
+ALARM_BITS = {
+    0x1: 'contactor_fail_e05',
+    0x2: 'link_fail_e08',
+    0x4: 'flow1_fail_e01',
+    0x8: 'wifiterm_fail_e07',
+    0x10: 'tevap_fail_e09',
+    0x20: 'tcompover_fail_e02',
+    0x40: 'tevaplow_fail_e03',
+    0x80: 'kkb1_fail_e04',
+    0x100: 'clock_fail_e06',
+    0x200: 'wifi_error_e0A',
+    0x4000: 'crit_tsens_fail',
+    0x8000: 'lcdversion_fail',
+}
+
+def heater_stage_from_raw(v):
+    if v is None:
+        return None
+    if 9 <= v <= 84:
+        return 1
+    if 85 <= v <= 169:
+        return 2
+    if 170 <= v <= 255:
+        return 3
+    return 0
+
+def dhw_heater_on(v):
+    if v is None:
+        return None
+    return 'ON' if (v & 0x1) else 'OFF'
+
+def decode_alarm(v):
+    if v is None:
+        return None
+    names = [name for bit, name in ALARM_BITS.items() if v & bit]
+    return 'ok' if not names else ','.join(names)
 
 class TemzitClient:
     def __init__(self, host, port, timeout):
         self.host = host; self.port = port; self.timeout = timeout; self.lock = threading.Lock()
-    def _query(self, payload: bytes, label: str):
+    def _query(self, payload: bytes):
         with self.lock:
             t0 = time.time()
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
@@ -44,7 +80,7 @@ class TemzitClient:
                 dt = round((time.time() - t0) * 1000)
                 return data, dt
     def get_sync(self):
-        data, dt = self._query(bytes([CMD_SYNC, 0x00]), 'sync')
+        data, dt = self._query(bytes([CMD_SYNC, 0x00]))
         if len(data) < 4:
             raise TimeoutError(f'sync short reply: {len(data)} bytes')
         if data[0] != RESP_ACTUAL:
@@ -58,6 +94,12 @@ class TemzitClient:
         def t(off):
             v = u16le(p, off)
             return None if v is None else v / 10.0
+        flow_raw = u16le(p, 18)
+        heater_state = u16le(p, 24)
+        dhw_state = u16le(p, 26)
+        alarm = u16le(p, 30)
+        compressor_hz_1 = p[22] if len(p) > 22 else None
+        compressor_hz_2 = p[23] if len(p) > 23 else None
         return {
             'diag_sync_len': len(data),
             'diag_sync_ms': dt,
@@ -70,15 +112,21 @@ class TemzitClient:
             't_freon_gas': t(12),
             't_freon_liquid': t(14),
             't_dhw': t(16),
-            'flow_raw': u16le(p, 18),
+            'flow_raw': flow_raw,
+            'flow_l_min': None if flow_raw is None else flow_raw * 4,
             'compressor_type': p[20] if len(p) > 20 else None,
             'compressor_active': p[21] if len(p) > 21 else None,
-            'compressor_rpm_1': p[22] if len(p) > 22 else None,
-            'compressor_rpm_2': p[23] if len(p) > 23 else None,
-            'heater_state': u16le(p, 24),
-            'dhw_heater_state': u16le(p, 26),
+            'compressor_hz_1': compressor_hz_1,
+            'compressor_hz_2': compressor_hz_2,
+            'compressor_rpm_1': compressor_hz_1,
+            'compressor_rpm_2': compressor_hz_2,
+            'heater_state_raw': heater_state,
+            'heater_stage': heater_stage_from_raw(heater_state),
+            'dhw_heater_state_raw': dhw_state,
+            'dhw_heater_on': dhw_heater_on(dhw_state),
             'power_kw': None if u16le(p, 28) is None else u16le(p, 28) / 100.0,
-            'alarm': u16le(p, 30),
+            'alarm': alarm,
+            'alarm_text': decode_alarm(alarm),
             'active_schedule_no': p[45] if len(p) > 45 else None,
             'active_schedule_mode': p[46] if len(p) > 46 else None,
             'set_room': p[49] if len(p) > 49 else None,
@@ -92,7 +140,7 @@ class TemzitClient:
             'minute': p[58] if len(p) > 58 else None,
         }
     def get_cfg(self):
-        data, dt = self._query(bytes([CMD_REQCFG, 0x00]), 'cfg')
+        data, dt = self._query(bytes([CMD_REQCFG, 0x00]))
         if len(data) < 4:
             raise TimeoutError(f'cfg short reply: {len(data)} bytes')
         if data[0] != RESP_CONFIG:
@@ -148,11 +196,15 @@ class Bridge:
             ('freon_liquid_temperature', 'Темзит фреон жидкость', 't_freon_liquid', 'temperature', '°C'),
             ('power_kw', 'Темзит мощность', 'power_kw', 'power', 'kW'),
             ('flow_raw', 'Темзит проток raw', 'flow_raw', None, None),
+            ('flow_l_min', 'Темзит проток', 'flow_l_min', None, 'L/min'),
+            ('compressor_hz_1', 'Темзит ККБ1 Гц', 'compressor_hz_1', None, 'Hz'),
+            ('compressor_hz_2', 'Темзит ККБ2 Гц', 'compressor_hz_2', None, 'Hz'),
+            ('heater_state_raw', 'Темзит ТЭН raw', 'heater_state_raw', None, None),
+            ('heater_stage', 'Темзит ступень ТЭНа', 'heater_stage', None, None),
+            ('dhw_heater_state_raw', 'Темзит БКН ТЭН raw', 'dhw_heater_state_raw', None, None),
+            ('alarm', 'Темзит авария raw', 'alarm', None, None),
             ('diag_sync_len', 'Темзит diag sync len', 'diag_sync_len', None, None),
             ('diag_sync_ms', 'Темзит diag sync ms', 'diag_sync_ms', None, 'ms'),
-            ('alarm', 'Темзит авария', 'alarm', None, None),
-            ('compressor_rpm_1', 'Темзит ККБ1 RPM', 'compressor_rpm_1', None, None),
-            ('compressor_rpm_2', 'Темзит ККБ2 RPM', 'compressor_rpm_2', None, None),
             ('set_room', 'Темзит уставка комнаты', 'set_room', 'temperature', '°C'),
             ('set_water', 'Темзит уставка воды', 'set_water', 'temperature', '°C'),
             ('set_dhw', 'Темзит уставка ГВС', 'set_dhw', 'temperature', '°C'),
@@ -178,6 +230,38 @@ class Bridge:
                 cfg['dev_cla'] = devcls
             if unit:
                 cfg['unit_of_meas'] = unit
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{object_id}/config', cfg)
+        # binary sensors
+        bin_sensors = [
+            ('dhw_heater_on', 'Темзит ТЭН БКН', 'dhw_heater_on'),
+        ]
+        for object_id, name, field in bin_sensors:
+            cfg = {
+                'name': name,
+                'uniq_id': f'temzit_{object_id}',
+                'stat_t': f'{MQTT_PREFIX}/state/{field}',
+                'payload_on': 'ON',
+                'payload_off': 'OFF',
+                'availability_topic': f'{MQTT_PREFIX}/availability',
+                'payload_available': 'online',
+                'payload_not_available': 'offline',
+                'device': device,
+            }
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/binary_sensor/temzit_{object_id}/config', cfg)
+        # text sensors
+        text_sensors = [
+            ('alarm_text', 'Темзит авария текст', 'alarm_text'),
+        ]
+        for object_id, name, field in text_sensors:
+            cfg = {
+                'name': name,
+                'uniq_id': f'temzit_{object_id}',
+                'stat_t': f'{MQTT_PREFIX}/state/{field}',
+                'availability_topic': f'{MQTT_PREFIX}/availability',
+                'payload_available': 'online',
+                'payload_not_available': 'offline',
+                'device': device,
+            }
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{object_id}/config', cfg)
         self.discovery_sent = True
     def maybe_poll_cfg(self):
