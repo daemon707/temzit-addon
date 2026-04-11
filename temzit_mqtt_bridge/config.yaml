@@ -1,7 +1,7 @@
 name: "Temzit MQTT Bridge"
-version: "0.2.1"
+version: "0.2.2"
 slug: "temzit_mqtt_bridge"
-description: "Read-only local TCP to MQTT bridge for Temzit heat pumps with extended SYNC sensors"
+description: "Read-only local TCP to MQTT bridge for Temzit heat pumps with SYNC + REQCFG sensors"
 url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"
 arch:
   - amd64
@@ -14,6 +14,7 @@ options:
   temzit_port: 333
   temzit_timeout: 15
   temzit_sync_interval: 60
+  temzit_cfg_interval: 900
   temzit_retry_delay: 15
   mqtt_host: "192.168.1.50"
   mqtt_port: 1883
@@ -27,6 +28,7 @@ schema:
   temzit_port: int?
   temzit_timeout: int?
   temzit_sync_interval: int?
+  temzit_cfg_interval: int?
   temzit_retry_delay: int?
   mqtt_host: str
   mqtt_port: int?
