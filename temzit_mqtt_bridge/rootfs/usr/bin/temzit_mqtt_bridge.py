@@ -6,6 +6,7 @@ TEMZIT_HOST = os.getenv('TEMZIT_HOST', '192.168.2.20')
 TEMZIT_PORT = int(os.getenv('TEMZIT_PORT', '333'))
 TEMZIT_TIMEOUT = int(os.getenv('TEMZIT_TIMEOUT', '15'))
 TEMZIT_SYNC_INTERVAL = int(os.getenv('TEMZIT_SYNC_INTERVAL', '60'))
+ENABLE_REQCFG = os.getenv('ENABLE_REQCFG', 'false').lower() == 'true'
 TEMZIT_CFG_INTERVAL = int(os.getenv('TEMZIT_CFG_INTERVAL', '900'))
 TEMZIT_RETRY_DELAY = int(os.getenv('TEMZIT_RETRY_DELAY', '15'))
 MQTT_HOST = os.getenv('MQTT_HOST', '192.168.1.50')
@@ -28,30 +29,24 @@ def u16le(buf: bytes, off: int):
         return None
     return int.from_bytes(buf[off:off+2], 'little', signed=False)
 
-FLOWMETER_TYPES = {
-    0: 'unknown',
-    1: 'impulse_1l',
-    2: 'impulse_10l',
-    3: 'dual_channel',
-    4: 'electronic',
-    5: 'fixed',
-    6: 'reed_switch',
-}
+FLOWMETER_TYPES = {0:'unknown',1:'impulse_1l',2:'impulse_10l',3:'dual_channel',4:'electronic',5:'fixed',6:'reed_switch'}
 
 class TemzitClient:
     def __init__(self, host, port, timeout):
         self.host = host; self.port = port; self.timeout = timeout; self.lock = threading.Lock()
-    def _query(self, payload: bytes):
+    def _query(self, payload: bytes, label: str):
         with self.lock:
+            t0 = time.time()
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
                 s.settimeout(self.timeout)
                 s.sendall(payload)
                 data = s.recv(64)
-                if len(data) < 4:
-                    raise TimeoutError(f'short reply: {len(data)} bytes')
-                return data
+                dt = round((time.time() - t0) * 1000)
+                return data, dt
     def get_sync(self):
-        data = self._query(bytes([CMD_SYNC, 0x00]))
+        data, dt = self._query(bytes([CMD_SYNC, 0x00]), 'sync')
+        if len(data) < 4:
+            raise TimeoutError(f'sync short reply: {len(data)} bytes')
         if data[0] != RESP_ACTUAL:
             raise ValueError(f'unexpected sync reply type: {data[0]}')
         p = data[2:62] if len(data) >= 62 else data[2:]
@@ -64,7 +59,8 @@ class TemzitClient:
             v = u16le(p, off)
             return None if v is None else v / 10.0
         return {
-            'raw_len': len(data),
+            'diag_sync_len': len(data),
+            'diag_sync_ms': dt,
             'mode_code': u16le(p, 0),
             'schedule_no': u16le(p, 2),
             't_outdoor': t(4),
@@ -96,7 +92,9 @@ class TemzitClient:
             'minute': p[58] if len(p) > 58 else None,
         }
     def get_cfg(self):
-        data = self._query(bytes([CMD_REQCFG, 0x00]))
+        data, dt = self._query(bytes([CMD_REQCFG, 0x00]), 'cfg')
+        if len(data) < 4:
+            raise TimeoutError(f'cfg short reply: {len(data)} bytes')
         if data[0] != RESP_CONFIG:
             raise ValueError(f'unexpected cfg reply type: {data[0]}')
         if len(data) >= 64:
@@ -107,6 +105,8 @@ class TemzitClient:
         p = data[1:31]
         flowmeter_type = p[22] if len(p) > 22 else None
         return {
+            'diag_cfg_len': len(data),
+            'diag_cfg_ms': dt,
             'cfg_room_target': p[1] if len(p) > 1 else None,
             'cfg_water_target': p[2] if len(p) > 2 else None,
             'cfg_dhw_target': p[7] if len(p) > 7 else None,
@@ -148,8 +148,8 @@ class Bridge:
             ('freon_liquid_temperature', 'Темзит фреон жидкость', 't_freon_liquid', 'temperature', '°C'),
             ('power_kw', 'Темзит мощность', 'power_kw', 'power', 'kW'),
             ('flow_raw', 'Темзит проток raw', 'flow_raw', None, None),
-            ('flowmeter_type', 'Темзит тип расходомера', 'cfg_flowmeter_type', None, None),
-            ('flowmeter_type_name', 'Темзит тип расходомера имя', 'cfg_flowmeter_type_name', None, None),
+            ('diag_sync_len', 'Темзит diag sync len', 'diag_sync_len', None, None),
+            ('diag_sync_ms', 'Темзит diag sync ms', 'diag_sync_ms', None, 'ms'),
             ('alarm', 'Темзит авария', 'alarm', None, None),
             ('compressor_rpm_1', 'Темзит ККБ1 RPM', 'compressor_rpm_1', None, None),
             ('compressor_rpm_2', 'Темзит ККБ2 RPM', 'compressor_rpm_2', None, None),
@@ -157,14 +157,21 @@ class Bridge:
             ('set_water', 'Темзит уставка воды', 'set_water', 'temperature', '°C'),
             ('set_dhw', 'Темзит уставка ГВС', 'set_dhw', 'temperature', '°C'),
             ('compressor_limit', 'Темзит лимит ККБ', 'set_compressor_limit', None, '%'),
-            ('cfg_room_target', 'Темзит конфиг уставка комнаты', 'cfg_room_target', 'temperature', '°C'),
-            ('cfg_water_target', 'Темзит конфиг уставка воды', 'cfg_water_target', 'temperature', '°C'),
-            ('cfg_dhw_target', 'Темзит конфиг уставка ГВС', 'cfg_dhw_target', 'temperature', '°C'),
-            ('cfg_weather_comp', 'Темзит погодозависимая автоматика', 'cfg_weather_comp', None, None),
-            ('cfg_backup_type', 'Темзит тип резерва', 'cfg_backup_type', None, None),
             ('active_schedule_no', 'Темзит активное расписание', 'active_schedule_no', None, None),
             ('active_schedule_mode', 'Темзит режим расписания', 'active_schedule_mode', None, None),
         ]
+        if ENABLE_REQCFG:
+            sensors += [
+                ('flowmeter_type', 'Темзит тип расходомера', 'cfg_flowmeter_type', None, None),
+                ('flowmeter_type_name', 'Темзит тип расходомера имя', 'cfg_flowmeter_type_name', None, None),
+                ('cfg_room_target', 'Темзит конфиг уставка комнаты', 'cfg_room_target', 'temperature', '°C'),
+                ('cfg_water_target', 'Темзит конфиг уставка воды', 'cfg_water_target', 'temperature', '°C'),
+                ('cfg_dhw_target', 'Темзит конфиг уставка ГВС', 'cfg_dhw_target', 'temperature', '°C'),
+                ('cfg_weather_comp', 'Темзит погодозависимая автоматика', 'cfg_weather_comp', None, None),
+                ('cfg_backup_type', 'Темзит тип резерва', 'cfg_backup_type', None, None),
+                ('diag_cfg_len', 'Темзит diag cfg len', 'diag_cfg_len', None, None),
+                ('diag_cfg_ms', 'Темзит diag cfg ms', 'diag_cfg_ms', None, 'ms'),
+            ]
         for object_id, name, field, devcls, unit in sensors:
             cfg = {'name': name, 'uniq_id': f'temzit_{object_id}', 'stat_t': f'{MQTT_PREFIX}/state/{field}', 'availability_topic': f'{MQTT_PREFIX}/availability', 'payload_available': 'online', 'payload_not_available': 'offline', 'device': device}
             if devcls:
@@ -174,6 +181,8 @@ class Bridge:
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{object_id}/config', cfg)
         self.discovery_sent = True
     def maybe_poll_cfg(self):
+        if not ENABLE_REQCFG:
+            return
         now = time.time()
         if now - self.last_cfg_poll < TEMZIT_CFG_INTERVAL:
             return
@@ -196,10 +205,11 @@ class Bridge:
                 for k, v in state.items():
                     if v is not None:
                         self.publish(f'{MQTT_PREFIX}/state/{k}', v)
-                try:
-                    self.maybe_poll_cfg()
-                except Exception as ce:
-                    self.publish(f'{MQTT_PREFIX}/bridge/error', {'cfg_error': str(ce)})
+                if ENABLE_REQCFG:
+                    try:
+                        self.maybe_poll_cfg()
+                    except Exception as ce:
+                        self.publish(f'{MQTT_PREFIX}/bridge/error', {'cfg_error': str(ce)})
             except Exception as e:
                 self.publish(f'{MQTT_PREFIX}/availability', 'degraded')
                 self.publish(f'{MQTT_PREFIX}/bridge/error', {'error': str(e)})
