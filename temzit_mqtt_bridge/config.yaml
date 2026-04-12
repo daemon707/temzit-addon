@@ -1,5 +1,5 @@
 name: "Temzit MQTT Bridge"
-version: "0.2.4"
+version: "0.2.5"
 slug: "temzit_mqtt_bridge"
 description: "Read-only local TCP to MQTT bridge for Temzit heat pumps with decoded SYNC values"
 url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"

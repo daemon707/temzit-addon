@@ -187,42 +187,42 @@ class Bridge:
             return
         device = {'identifiers': ['temzit_hp_1'], 'name': 'Temzit Heat Pump', 'manufacturer': 'ТЭМЗИТ', 'model': 'Hydromodule'}
         sensors = [
-            ('outdoor_temperature', 'Темзит улица', 't_outdoor', 'temperature', '°C'),
-            ('room_temperature', 'Темзит комната', 't_room', 'temperature', '°C'),
-            ('supply_temperature', 'Темзит подача', 't_supply', 'temperature', '°C'),
-            ('return_temperature', 'Темзит обратка', 't_return', 'temperature', '°C'),
-            ('dhw_temperature', 'Темзит ГВС', 't_dhw', 'temperature', '°C'),
-            ('freon_gas_temperature', 'Темзит фреон газ', 't_freon_gas', 'temperature', '°C'),
-            ('freon_liquid_temperature', 'Темзит фреон жидкость', 't_freon_liquid', 'temperature', '°C'),
-            ('power_kw', 'Темзит мощность', 'power_kw', 'power', 'kW'),
-            ('flow_raw', 'Темзит проток raw', 'flow_raw', None, None),
-            ('flow_l_min', 'Темзит проток', 'flow_l_min', None, 'L/min'),
-            ('compressor_hz_1', 'Темзит ККБ1 Гц', 'compressor_hz_1', None, 'Hz'),
-            ('compressor_hz_2', 'Темзит ККБ2 Гц', 'compressor_hz_2', None, 'Hz'),
-            ('heater_state_raw', 'Темзит ТЭН raw', 'heater_state_raw', None, None),
-            ('heater_stage', 'Темзит ступень ТЭНа', 'heater_stage', None, None),
-            ('dhw_heater_state_raw', 'Темзит БКН ТЭН raw', 'dhw_heater_state_raw', None, None),
-            ('alarm', 'Темзит авария raw', 'alarm', None, None),
-            ('diag_sync_len', 'Темзит diag sync len', 'diag_sync_len', None, None),
-            ('diag_sync_ms', 'Темзит diag sync ms', 'diag_sync_ms', None, 'ms'),
-            ('set_room', 'Темзит уставка комнаты', 'set_room', 'temperature', '°C'),
-            ('set_water', 'Темзит уставка воды', 'set_water', 'temperature', '°C'),
-            ('set_dhw', 'Темзит уставка ГВС', 'set_dhw', 'temperature', '°C'),
-            ('compressor_limit', 'Темзит лимит ККБ', 'set_compressor_limit', None, '%'),
-            ('active_schedule_no', 'Темзит активное расписание', 'active_schedule_no', None, None),
-            ('active_schedule_mode', 'Темзит режим расписания', 'active_schedule_mode', None, None),
+            ('outdoor_temperature', 'Температура улица', 't_outdoor', 'temperature', '°C'),
+            ('room_temperature', 'Температура дом', 't_room', 'temperature', '°C'),
+            ('supply_temperature', 'Температура подачи', 't_supply', 'temperature', '°C'),
+            ('return_temperature', 'Температура обратки', 't_return', 'temperature', '°C'),
+            ('dhw_temperature', 'Температура ГВС', 't_dhw', 'temperature', '°C'),
+            ('freon_gas_temperature', 'Фреон t газа', 't_freon_gas', 'temperature', '°C'),
+            ('freon_liquid_temperature', 'Фреон t жидкости', 't_freon_liquid', 'temperature', '°C'),
+            ('power_kw', 'Мощность', 'power_kw', 'power', 'kW'),
+            ('flow_raw', 'Проток raw', 'flow_raw', None, None),
+            ('flow_l_min', 'Скорость протока', 'flow_l_min', None, 'L/min'),
+            ('compressor_hz_1', 'ККБ1 Гц', 'compressor_hz_1', None, 'Hz'),
+            ('compressor_hz_2', 'ККБ2 Гц', 'compressor_hz_2', None, 'Hz'),
+            ('heater_state_raw', 'ТЭН raw', 'heater_state_raw', None, None),
+            ('heater_stage', 'Ступень ТЭНа', 'heater_stage', None, None),
+            ('dhw_heater_state_raw', 'БКН ТЭН raw', 'dhw_heater_state_raw', None, None),
+            ('alarm', 'Авария raw', 'alarm', None, None),
+            ('diag_sync_len', 'Diag sync len', 'diag_sync_len', None, None),
+            ('diag_sync_ms', 'Diag sync ms', 'diag_sync_ms', None, 'ms'),
+            ('set_room', 'Расписание t комнаты', 'set_room', 'temperature', '°C'),
+            ('set_water', 'Расписание t воды', 'set_water', 'temperature', '°C'),
+            ('set_dhw', 'Расписание t ГВС', 'set_dhw', 'temperature', '°C'),
+            ('compressor_limit', 'Мощность ККБ %', 'set_compressor_limit', None, '%'),
+            ('active_schedule_no', 'Активное расписание', 'active_schedule_no', None, None),
+            ('active_schedule_mode', 'Режим расписания', 'active_schedule_mode', None, None),
         ]
         if ENABLE_REQCFG:
             sensors += [
-                ('flowmeter_type', 'Темзит тип расходомера', 'cfg_flowmeter_type', None, None),
-                ('flowmeter_type_name', 'Темзит тип расходомера имя', 'cfg_flowmeter_type_name', None, None),
-                ('cfg_room_target', 'Темзит конфиг уставка комнаты', 'cfg_room_target', 'temperature', '°C'),
-                ('cfg_water_target', 'Темзит конфиг уставка воды', 'cfg_water_target', 'temperature', '°C'),
-                ('cfg_dhw_target', 'Темзит конфиг уставка ГВС', 'cfg_dhw_target', 'temperature', '°C'),
-                ('cfg_weather_comp', 'Темзит погодозависимая автоматика', 'cfg_weather_comp', None, None),
-                ('cfg_backup_type', 'Темзит тип резерва', 'cfg_backup_type', None, None),
-                ('diag_cfg_len', 'Темзит diag cfg len', 'diag_cfg_len', None, None),
-                ('diag_cfg_ms', 'Темзит diag cfg ms', 'diag_cfg_ms', None, 'ms'),
+                ('flowmeter_type', 'Тип расходомера', 'cfg_flowmeter_type', None, None),
+                ('flowmeter_type_name', 'Тип расходомера имя', 'cfg_flowmeter_type_name', None, None),
+                ('cfg_room_target', 'Конфиг t комнаты', 'cfg_room_target', 'temperature', '°C'),
+                ('cfg_water_target', 'Конфиг t воды', 'cfg_water_target', 'temperature', '°C'),
+                ('cfg_dhw_target', 'Конфиг t ГВС', 'cfg_dhw_target', 'temperature', '°C'),
+                ('cfg_weather_comp', 'Погодозависимая автоматика', 'cfg_weather_comp', None, None),
+                ('cfg_backup_type', 'Тип резерва', 'cfg_backup_type', None, None),
+                ('diag_cfg_len', 'Diag cfg len', 'diag_cfg_len', None, None),
+                ('diag_cfg_ms', 'Diag cfg ms', 'diag_cfg_ms', None, 'ms'),
             ]
         for object_id, name, field, devcls, unit in sensors:
             cfg = {'name': name, 'uniq_id': f'temzit_{object_id}', 'stat_t': f'{MQTT_PREFIX}/state/{field}', 'availability_topic': f'{MQTT_PREFIX}/availability', 'payload_available': 'online', 'payload_not_available': 'offline', 'device': device}
@@ -233,7 +233,7 @@ class Bridge:
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{object_id}/config', cfg)
         # binary sensors
         bin_sensors = [
-            ('dhw_heater_on', 'Темзит ТЭН БКН', 'dhw_heater_on'),
+            ('dhw_heater_on', 'ТЭН БКН', 'dhw_heater_on'),
         ]
         for object_id, name, field in bin_sensors:
             cfg = {
@@ -250,7 +250,7 @@ class Bridge:
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/binary_sensor/temzit_{object_id}/config', cfg)
         # text sensors
         text_sensors = [
-            ('alarm_text', 'Темзит авария текст', 'alarm_text'),
+            ('alarm_text', 'Авария', 'alarm_text'),
         ]
         for object_id, name, field in text_sensors:
             cfg = {
