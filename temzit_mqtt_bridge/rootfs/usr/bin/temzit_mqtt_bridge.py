@@ -452,7 +452,7 @@ class Bridge:
             ('cfg_dhw_target',              'Конфиг t ГВС',               'cfg_dhw_target',             'temperature', '°C'),
             ('cfg_boiler_mode_name',        'Режим ГВС (конфиг)',         'cfg_boiler_mode_name',       None,          None),
             ('cfg_compressor_limit_pct',    'Лимит ККБ (конфиг)',         'cfg_compressor_limit_pct',   None,          '%'),
-            ('cfg_weather_comp',            'Погодная компенсация',       'cfg_weather_comp',           None,          '°C/°C'),
+            ('cfg_weather_comp',            'Погодная компенсация',       'cfg_weather_comp',           None,          '°C'),
             ('cfg_ten_on_outdoor',          'Т включения ТЭНа',           'cfg_ten_on_outdoor',         'temperature', '°C'),
             ('cfg_kkb_off_outdoor',         'Т выкл. компрессора',        'cfg_kkb_off_outdoor',        'temperature', '°C'),
             ('cfg_dhw_max_from_compressor', 'Макс t ГВС от ТН',          'cfg_dhw_max_from_compressor','temperature', '°C'),
