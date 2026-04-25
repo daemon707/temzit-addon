@@ -14,7 +14,7 @@ export MQTT_PASS="$(bashio::config 'mqtt_pass')"
 export MQTT_PREFIX="$(bashio::config 'mqtt_prefix')"
 export MQTT_DISCOVERY_PREFIX="$(bashio::config 'mqtt_discovery_prefix')"
 export MQTT_CLIENT_ID="$(bashio::config 'mqtt_client_id')"
-bashio::log.info "Starting Temzit MQTT Bridge v0.3.0"
+bashio::log.info "Starting Temzit MQTT Bridge v0.5.0"
 bashio::log.info "Temzit host: ${TEMZIT_HOST}:${TEMZIT_PORT}"
 bashio::log.info "SYNC interval: ${TEMZIT_SYNC_INTERVAL}s | CFG poll: ${TEMZIT_CFG_INTERVAL}s"
 exec python3 /usr/bin/temzit_mqtt_bridge.py
