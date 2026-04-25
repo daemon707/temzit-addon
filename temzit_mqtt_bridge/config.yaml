@@ -1,0 +1,41 @@
+name: "Temzit MQTT Bridge"
+version: "0.2.7"
+slug: "temzit_mqtt_bridge"
+description: "Local TCP to MQTT bridge for Temzit heat pumps with decoded CFG30/REQCFG values"
+url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"
+arch:
+- amd64
+startup: application
+boot: auto
+init: false
+host_network: true
+options:
+  temzit_host: "192.168.2.20"
+  temzit_port: 333
+  temzit_timeout: 15
+  temzit_sync_interval: 60
+  temzit_cfg_interval: 900
+  temzit_cfg_delay_after_sync: 12
+  temzit_retry_delay: 15
+  mqtt_host: "192.168.1.50"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_pass: ""
+  mqtt_prefix: "temzit"
+  mqtt_discovery_prefix: "homeassistant"
+  mqtt_client_id: "temzit-bridge"
+schema:
+  temzit_host: str
+  temzit_port: int?
+  temzit_timeout: int?
+  temzit_sync_interval: int?
+  temzit_cfg_interval: int?
+  temzit_cfg_delay_after_sync: int?
+  temzit_retry_delay: int?
+  mqtt_host: str
+  mqtt_port: int?
+  mqtt_user: str?
+  mqtt_pass: str?
+  mqtt_prefix: str?
+  mqtt_discovery_prefix: str?
+  mqtt_client_id: str?
