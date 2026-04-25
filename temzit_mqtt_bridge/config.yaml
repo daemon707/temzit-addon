@@ -1,42 +1,31 @@
-name: "Temzit MQTT Bridge"
-version: "0.3.0"
-slug: "temzit_mqtt_bridge"
-description: "Local TCP→MQTT bridge for Temzit heat pumps with climate entity and write support"
-url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"
-arch:
-  - amd64
-  - aarch64
+name: "Темзит MQTT Bridge"
+version: "0.5.0"
+slug: temzit_mqtt
+description: "Интеграция теплового насоса Темзит с Home Assistant через MQTT Discovery"
+arch: [aarch64, amd64, armhf, armv7, i386]
 startup: application
 boot: auto
 init: false
-host_network: true
 options:
-  temzit_host: "192.168.2.20"
-  temzit_port: 333
-  temzit_timeout: 15
-  temzit_sync_interval: 60
-  temzit_cfg_interval: 900
-  temzit_cfg_delay_after_sync: 12
-  temzit_retry_delay: 15
-  mqtt_host: "192.168.1.50"
+  temzit_host: "service.temzit.ru"
+  temzit_login: ""
+  temzit_password: ""
+  temzit_serial: ""
+  mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: ""
-  mqtt_pass: ""
+  mqtt_password: ""
   mqtt_prefix: "temzit"
-  mqtt_discovery_prefix: "homeassistant"
-  mqtt_client_id: "temzit-bridge"
+  poll_interval: 60
 schema:
   temzit_host: str
-  temzit_port: int?
-  temzit_timeout: int?
-  temzit_sync_interval: int?
-  temzit_cfg_interval: int?
-  temzit_cfg_delay_after_sync: int?
-  temzit_retry_delay: int?
+  temzit_login: str
+  temzit_password: str
+  temzit_serial: str
   mqtt_host: str
-  mqtt_port: int?
-  mqtt_user: str?
-  mqtt_pass: str?
-  mqtt_prefix: str?
-  mqtt_discovery_prefix: str?
-  mqtt_client_id: str?
+  mqtt_port: int
+  mqtt_user: str
+  mqtt_password: str
+  mqtt_prefix: str
+  poll_interval: int
+map: []
