@@ -199,7 +199,7 @@ class TemzitClient:
             'flow_raw':         flow_raw,
             # v0.5.3: *0.025 (было *4)
             'flow_l_min':       None if flow_raw is None
-                                     else round(flow_raw * 0.025, 2),
+                                     else round(flow_raw * 4, 2),
             'compressor_type':  compressor_type,
             'compressor_model': compressor_model,
             'compressor_hz_1':  compressor_hz_1,
