@@ -358,6 +358,7 @@ class Bridge:
         climate_cfg = {
             'name': 'Temzit',
             'uniq_id': 'temzit_climate',
+            'object_id': 'temzit_climate',
             'device': device,
             **avail,
             # Текущая температура комнаты
@@ -381,6 +382,7 @@ class Bridge:
         dhw_cfg = {
             'name': 'Temzit ГВС',
             'uniq_id': 'temzit_dhw_climate',
+            'object_id': 'temzit_dhw_climate',
             'device': device,
             **avail,
             'curr_temp_t':  f'{MQTT_PREFIX}/state/t_dhw',
@@ -423,6 +425,7 @@ class Bridge:
             cfg = {
                 'name': name,
                 'uniq_id': f'temzit_{object_id}',
+                'object_id': f'temzit_{object_id}',
                 'stat_t': f'{MQTT_PREFIX}/state/{field}',
                 'device': device,
                 **avail,
@@ -440,6 +443,7 @@ class Bridge:
             cfg = {
                 'name': name,
                 'uniq_id': f'temzit_{object_id}',
+                'object_id': f'temzit_{object_id}',
                 'stat_t': f'{MQTT_PREFIX}/state/{field}',
                 'payload_on': 'ON', 'payload_off': 'OFF',
                 'device': device,
@@ -454,6 +458,7 @@ class Bridge:
         alarm_cfg = {
             'name': 'Авария',
             'uniq_id': 'temzit_alarm_text',
+            'object_id': 'temzit_alarm_text',
             'stat_t': f'{MQTT_PREFIX}/state/alarm_text',
             'device': device,
             **avail,
@@ -471,6 +476,7 @@ class Bridge:
             cfg = {
                 'name': name,
                 'uniq_id': f'temzit_{obj_id}',
+                'object_id': f'temzit_{obj_id}',
                 'stat_t': stat_t,
                 'cmd_t': cmd_t,
                 'min': mn, 'max': mx, 'step': step,
