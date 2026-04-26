@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.5.5
+Temzit MQTT Bridge v0.5.6
 - v0.5.1: исправлены смещения get_sync/get_cfg/set_cfg
 - v0.5.2: compressor_active из hz>0; power_kw /10.0
 - v0.5.3: flow_l_min *0.025; set_compressor_limit_pct; cfg_weather_comp = float
