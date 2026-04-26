@@ -531,6 +531,9 @@ class Bridge:
         self._last_cfg_raw = cfg.get('_raw')
         self.publish(f'{MQTT_PREFIX}/cfg/json',
                      {k: v for k, v in cfg.items() if k != '_raw'})
+        # 0.5.5 raw start
+        self.publish(f"{MQTT_PREFIX}/cfg/raw", cfg.get('raw'))
+        # 0.5.5 raw end
         for k, v in cfg.items():
             if v is not None and k != '_raw':
                 self.publish(f'{MQTT_PREFIX}/state/{k}', str(v))
