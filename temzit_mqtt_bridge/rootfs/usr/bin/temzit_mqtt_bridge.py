@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.6.1
+Temzit MQTT Bridge v0.6.2
 - v0.5.1: исправлены смещения get_sync/get_cfg/set_cfg
 - v0.5.2: compressor_active из hz>0; power_kw /10.0
 - v0.5.3: flow_l_min *0.025; set_compressor_limit_pct; cfg_weather_comp = float
@@ -13,7 +13,9 @@ Temzit MQTT Bridge v0.6.1
 - v0.6.0: try/except вокруг set_cfg с логированием и возвратом команд в очередь при ошибке;
           после успешного set_cfg обновляем SYNC и CFG для немедленного отражения в HA
 - v0.6.1: TEMZIT_CFG_DELAY_AFTER_SYNC применяется везде где CFG следует за SYNC
-          (_force_sync_and_cfg, _force_cfg_then_flush) — исключает connection refused
+- v0.6.2: КРИТИЧНО — исправлен формат пакета set_cfg согласно официальному протоколу:
+          КС теперь 1 байт (сумма всех байт включая cmd), поле len убрано из пакета;
+          добавлено подробное логирование байт запроса и ответа set_cfg
 """
 import os, time, json, socket, threading
 import paho.mqtt.client as mqtt
@@ -33,7 +35,7 @@ MQTT_PREFIX                 = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX       = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID              = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 CMD_SYNC    = 0x30
 CMD_REQCFG  = 0x34
@@ -116,9 +118,15 @@ def decode_alarm(v):
     return 'ok' if not names else ','.join(names)
 
 def build_setcfg(cfg_bytes: list) -> bytes:
-    payload = bytes([CMD_SETCFG, len(cfg_bytes)] + cfg_bytes)
-    crc = checksum16(payload)
-    return payload + crc.to_bytes(2, 'little')
+    """
+    Формат согласно официальному протоколу Темзит (HM_Protocol.pdf):
+    [0x35] + [30 байт данных] + [КС 1 байт]
+    КС = сумма всех байт включая cmd (1 байт, не 2!)
+    Итого пакет 32 байта.
+    """
+    payload = bytes([CMD_SETCFG] + cfg_bytes)
+    crc = sum(payload) & 0xFF          # 1 байт!
+    return payload + bytes([crc])
 
 
 # ── TCP-клиент ───────────────────────────────────────────────────────────────
@@ -275,15 +283,17 @@ class TemzitClient:
             if offset < len(new_cfg):
                 new_cfg[offset] = int(value)
         packet = build_setcfg(new_cfg)
+        print(f'set_cfg packet ({len(packet)} bytes): {list(packet)}', flush=True)
         with self.lock:
             with socket.create_connection((self.host, self.port),
                                           timeout=self.timeout) as s:
                 s.settimeout(self.timeout)
                 s.sendall(packet)
                 try:
-                    s.recv(64)
-                except Exception:
-                    pass
+                    resp = s.recv(64)
+                    print(f'set_cfg response ({len(resp)} bytes): {list(resp)}', flush=True)
+                except Exception as ex:
+                    print(f'set_cfg no response: {ex}', flush=True)
 
 
 # ── MQTT Bridge ──────────────────────────────────────────────────────────────
@@ -364,17 +374,14 @@ class Bridge:
             updates = dict(self._pending_set)
             self._pending_set.clear()
 
-        # try/except — при ошибке логируем и возвращаем команды в очередь
         try:
             self.temzit.set_cfg(self._last_cfg_raw, updates)
             print(f'set_cfg OK: {updates}', flush=True)
-            # После set_cfg ждём паузу, затем обновляем SYNC и CFG
             threading.Timer(2.0, self._force_sync_and_cfg).start()
         except Exception as e:
             print(f'set_cfg ERROR: {e} updates={updates}', flush=True)
             self.publish(f'{MQTT_PREFIX}/bridge/error',
                          {'set_cfg_error': str(e), 'updates': str(updates)})
-            # Возвращаем команды в очередь для повтора
             with self._set_lock:
                 updates.update(self._pending_set)
                 self._pending_set = updates
@@ -457,35 +464,35 @@ class Bridge:
         })
 
         sensors = [
-            ('outdoor_temperature',       'Температура улица',       't_outdoor',                  'temperature', '°C'),
-            ('room_temperature',           'Температура дом',          't_room',                     'temperature', '°C'),
-            ('supply_temperature',         'Температура подачи',       't_supply',                   'temperature', '°C'),
-            ('return_temperature',         'Температура обратки',      't_return',                   'temperature', '°C'),
-            ('dhw_temperature',            'Температура ГВС',          't_dhw',                      'temperature', '°C'),
-            ('freon_gas_temperature',      'Фреон газ',                't_freon_gas',                'temperature', '°C'),
-            ('freon_liquid_temperature',   'Фреон жидкость',           't_freon_liquid',             'temperature', '°C'),
-            ('power_kw',                   'Мощность',                 'power_kw',                   'power',       'kW'),
-            ('flow_l_min',                 'Проток',                   'flow_l_min',                 None,          'L/min'),
-            ('compressor_hz_1',            'ККБ1 частота',             'compressor_hz_1',            'frequency',   'Hz'),
-            ('compressor_hz_2',            'ККБ2 частота',             'compressor_hz_2',            'frequency',   'Hz'),
-            ('heater_stage',               'Ступень ТЭНа',             'heater_stage',               None,          None),
-            ('mode_name',                  'Режим работы',             'mode_name',                  None,          None),
-            ('set_water',                  'Уставка t воды',           'set_water',                  'temperature', '°C'),
-            ('set_dhw_mode_name',          'Режим ГВС',                'set_dhw_mode_name',          None,          None),
-            ('set_compressor_limit_pct',   'Лимит ККБ',                'set_compressor_limit_pct',   None,          '%'),
-            ('set_compressor_limit_name',  'Лимит ККБ (текст)',         'set_compressor_limit_name',  None,          None),
-            ('cfg_water_target',           'Конфиг t воды',            'cfg_water_target',           'temperature', '°C'),
-            ('cfg_dhw_target',             'Конфиг t ГВС',             'cfg_dhw_target',             'temperature', '°C'),
-            ('cfg_boiler_mode_name',       'Режим ГВС (конфиг)',       'cfg_boiler_mode_name',       None,          None),
-            ('cfg_compressor_limit_pct',   'Лимит ККБ (конфиг)',       'cfg_compressor_limit_pct',   None,          '%'),
-            ('cfg_weather_comp',           'Погодная компенсация',     'cfg_weather_comp',           None,          None),
-            ('cfg_ten_on_outdoor',         'Т включения ТЭНа',         'cfg_ten_on_outdoor',         'temperature', '°C'),
-            ('cfg_kkb_off_outdoor',        'Т выкл. компрессора',      'cfg_kkb_off_outdoor',        'temperature', '°C'),
-            ('cfg_dhw_max_from_compressor','Макс t ГВС от ТН',         'cfg_dhw_max_from_compressor','temperature', '°C'),
-            ('cfg_backup_type_name',       'Внешний нагреватель',      'cfg_backup_type_name',       None,          None),
-            ('cfg_flowmeter_type_name',    'Датчик протока',            'cfg_flowmeter_type_name',    None,          None),
-            ('diag_sync_ms',               'Ping SYNC (мс)',            'diag_sync_ms',               None,          'ms'),
-            ('diag_cfg_ms',                'Ping CFG (мс)',             'diag_cfg_ms',                None,          'ms'),
+            ('outdoor_temperature',        'Температура улица',       't_outdoor',                  'temperature', '°C'),
+            ('room_temperature',            'Температура дом',          't_room',                     'temperature', '°C'),
+            ('supply_temperature',          'Температура подачи',       't_supply',                   'temperature', '°C'),
+            ('return_temperature',          'Температура обратки',      't_return',                   'temperature', '°C'),
+            ('dhw_temperature',             'Температура ГВС',          't_dhw',                      'temperature', '°C'),
+            ('freon_gas_temperature',       'Фреон газ',                't_freon_gas',                'temperature', '°C'),
+            ('freon_liquid_temperature',    'Фреон жидкость',           't_freon_liquid',             'temperature', '°C'),
+            ('power_kw',                    'Мощность',                 'power_kw',                   'power',       'kW'),
+            ('flow_l_min',                  'Проток',                   'flow_l_min',                 None,          'L/min'),
+            ('compressor_hz_1',             'ККБ1 частота',             'compressor_hz_1',            'frequency',   'Hz'),
+            ('compressor_hz_2',             'ККБ2 частота',             'compressor_hz_2',            'frequency',   'Hz'),
+            ('heater_stage',                'Ступень ТЭНа',             'heater_stage',               None,          None),
+            ('mode_name',                   'Режим работы',             'mode_name',                  None,          None),
+            ('set_water',                   'Уставка t воды',           'set_water',                  'temperature', '°C'),
+            ('set_dhw_mode_name',           'Режим ГВС',                'set_dhw_mode_name',          None,          None),
+            ('set_compressor_limit_pct',    'Лимит ККБ',                'set_compressor_limit_pct',   None,          '%'),
+            ('set_compressor_limit_name',   'Лимит ККБ (текст)',         'set_compressor_limit_name',  None,          None),
+            ('cfg_water_target',            'Конфиг t воды',            'cfg_water_target',           'temperature', '°C'),
+            ('cfg_dhw_target',              'Конфиг t ГВС',             'cfg_dhw_target',             'temperature', '°C'),
+            ('cfg_boiler_mode_name',        'Режим ГВС (конфиг)',       'cfg_boiler_mode_name',       None,          None),
+            ('cfg_compressor_limit_pct',    'Лимит ККБ (конфиг)',       'cfg_compressor_limit_pct',   None,          '%'),
+            ('cfg_weather_comp',            'Погодная компенсация',     'cfg_weather_comp',           None,          None),
+            ('cfg_ten_on_outdoor',          'Т включения ТЭНа',         'cfg_ten_on_outdoor',         'temperature', '°C'),
+            ('cfg_kkb_off_outdoor',         'Т выкл. компрессора',      'cfg_kkb_off_outdoor',        'temperature', '°C'),
+            ('cfg_dhw_max_from_compressor', 'Макс t ГВС от ТН',         'cfg_dhw_max_from_compressor','temperature', '°C'),
+            ('cfg_backup_type_name',        'Внешний нагреватель',      'cfg_backup_type_name',       None,          None),
+            ('cfg_flowmeter_type_name',     'Датчик протока',            'cfg_flowmeter_type_name',    None,          None),
+            ('diag_sync_ms',                'Ping SYNC (мс)',            'diag_sync_ms',               None,          'ms'),
+            ('diag_cfg_ms',                 'Ping CFG (мс)',             'diag_cfg_ms',                None,          'ms'),
         ]
 
         for object_id, name, field, devcls, unit in sensors:
