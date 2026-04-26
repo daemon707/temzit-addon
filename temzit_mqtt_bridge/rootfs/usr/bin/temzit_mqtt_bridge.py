@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.7.2
+Temzit MQTT Bridge v0.7.3
 
 - На базе 0.7.1: корректное чтение SYNC/CFG по HM_Protocol
 - ДОБАВЛЕНА безопасная запись: меняем только cfg_dhw_target (уставка ГВС)
@@ -419,18 +419,65 @@ class Bridge:
             })
             return
 
-        # Температура ГВС в CONFIG_MAIN: байт 7, диапазон 20–70 °C
         value = int(round(temp))
         value = max(20, min(70, value))
-        cfg = list(self._last_cfg_raw)
+
+        cfg_before = list(self._last_cfg_raw)
+        cfg = list(cfg_before)
         cfg[7] = value
 
         try:
+            self.publish(f'{MQTT_PREFIX}/bridge/info', {
+                'set_dhw_requested': value,
+                'cfg_before': cfg_before,
+                'cfg_after_local': cfg,
+            })
+
+            # 1. Запись CONFIG_MAIN
             self.temzit.set_cfg(cfg)
             self._last_cfg_raw = cfg
+
             self.publish(f'{MQTT_PREFIX}/bridge/info', {
                 'set_dhw_applied_cfg': value,
             })
+
+            # Пауза после записи, чтобы контроллер применил конфиг
+            time.sleep(3.0)
+
+            # 2. Отдельно читаем свежий CFG
+            try:
+                fresh_cfg = self.temzit.get_cfg()
+                self._publish_cfg(fresh_cfg)
+                self.publish(f'{MQTT_PREFIX}/bridge/info', {
+                    'set_dhw_cfg_readback_ok': True,
+                    'cfg_readback_raw': fresh_cfg.get('_raw'),
+                    'cfg_readback_target': fresh_cfg.get('cfg_dhw_target'),
+                })
+            except Exception as ce:
+                self.publish(f'{MQTT_PREFIX}/bridge/error', {
+                    'set_dhw_error': 'cfg_readback_failed',
+                    'detail': str(ce),
+                })
+                return
+
+            # Дополнительная пауза между get_cfg и get_sync
+            time.sleep(3.0)
+
+            # 3. Потом отдельно читаем SYNC
+            try:
+                fresh_state = self.temzit.get_sync()
+                self._publish_state(fresh_state)
+                self.publish(f'{MQTT_PREFIX}/bridge/info', {
+                    'set_dhw_sync_readback_ok': True,
+                    'sync_set_dhw': fresh_state.get('set_dhw'),
+                    'sync_t_dhw': fresh_state.get('t_dhw'),
+                })
+            except Exception as se:
+                self.publish(f'{MQTT_PREFIX}/bridge/error', {
+                    'set_dhw_error': 'sync_readback_failed',
+                    'detail': str(se),
+                })
+
         except Exception as e:
             self.publish(f'{MQTT_PREFIX}/bridge/error', {
                 'set_dhw_error': 'transport',
