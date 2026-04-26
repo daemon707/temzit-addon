@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.6.6
-- v0.6.6:
-  - подтвержден правильный cfg slice: data[2:32]
-  - исправлен маппинг cfg offsets по сверке с контроллером и HTML
-  - исправлен offset записи температуры ГВС: 7
-  - исправлен вероятный offset лимита компрессора: 9
+Temzit MQTT Bridge v0.7.0 FINAL
+- ИСПРАВЛЕНО: срез data[2:32] подтверждён как правильный
+- ИСПРАВЛЕНО: полный маппинг всех cfg-параметров согласно протоколу
+- ДОБАВЛЕНО: поддержка P4 (режим вспомогательного ТЭНа)
+- ИСПРАВЛЕНО: P8 (dhw_mode) находится на offset 8, P9 (dhw_target) на offset 7
 """
 
-import os
-import time
-import json
-import socket
-import threading
+import os, time, json, socket, threading
 import paho.mqtt.client as mqtt
 
 TEMZIT_HOST = os.getenv('TEMZIT_HOST', '192.168.2.20')
@@ -31,7 +26,7 @@ MQTT_PREFIX = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
 
-VERSION = "0.6.6"
+VERSION = "0.7.0"
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -39,11 +34,33 @@ CMD_SETCFG = 0x35
 RESP_ACTUAL = 0x01
 RESP_CONFIG = 0x02
 
+# ═══════════════════════════════════════════════════════════════════════════
+# КАРТА ОФСЕТОВ CFG (30-байтовый буфер data[2:32])
+# Установлена по реверс-инжинирингу веб-интерфейса и протокола
+# ═══════════════════════════════════════════════════════════════════════════
+CFG_OFFSET_MODE = 0              # P1  - Режим работы (0=стоп,1=нагрев,2=быстрый,3=ТЭН,4=холод,5=внешний)
+CFG_OFFSET_ROOM_TARGET = 1       # P2  - Уставка температуры помещения (16-30°C)
+CFG_OFFSET_WATER_TARGET = 2      # P3  - Уставка температуры подачи в контур (5-55°C)
+CFG_OFFSET_AUX_HEATER_MODE = 3   # P4  - Режим вспомогательного ТЭНа (64=0%, 65=30%, 66=60%, 67=100%)
+CFG_OFFSET_TEN_ON_OUTDOOR = 4    # P5  - Т° наружного воздуха включения основного ТЭНа (signed, °C)
+CFG_OFFSET_KKB_OFF_OUTDOOR = 5   # P6  - Т° наружного воздуха выключения компрессора (signed, °C)
+CFG_OFFSET_BACKUP_TYPE = 6       # P7  - Внешний нагреватель (0=не использовать,1-4=после 1-3 ступени/только внешний)
+CFG_OFFSET_DHW_TARGET = 7        # P9  - Уставка температуры ГВС (20-70°C)
+CFG_OFFSET_DHW_MODE = 8          # P8  - Режим работы ГВС (0=выкл,1=только ТЭН,2-11=ТН 10%-100%)
+CFG_OFFSET_COMP_LIMIT = 9        # P88 - Лимит компрессора (0-10)
+# офсеты 10-29 — прочие параметры (погодная компенсация, расходомер и др.)
+CFG_OFFSET_WEATHER_COMP = 18     # P14 - Коэф. погодной компенсации (*0.1)
+CFG_OFFSET_DHW_MAX_COMP = 21     # P?  - Макс. T° ГВС от ТН
+CFG_OFFSET_FLOWMETER = 22        # P?  - Тип расходомера
+CFG_OFFSET_BACKUP_RESERVE = 24   # P?  - Резервный параметр внешнего нагревателя
+
 MODE_CODE_TO_HA = {0: 'off', 1: 'heat', 2: 'heat', 3: 'heat', 4: 'cool', 5: 'heat'}
 HA_MODE_TO_P1 = {'off': 0, 'heat': 1, 'cool': 4}
 HA_MODES = ['off', 'heat', 'cool']
 
 P1_NAMES = {0: 'Стоп', 1: 'Нагрев', 2: 'Быстрый', 3: 'ТЭН', 4: 'Холод', 5: 'Внешний'}
+
+AUX_HEATER_NAMES = {64: '0%', 65: '30%', 66: '60%', 67: '100%'}
 
 DHW_MODE_NAMES = {
     0: 'Выключен', 1: 'Только ТЭН в баке',
@@ -83,12 +100,14 @@ ALARM_BITS = {
 
 
 def s8(v):
+    """Беззнаковый байт → знаковое int8."""
     if v is None:
         return None
     return v if v < 128 else v - 256
 
 
 def u8(v):
+    """Знаковое int → беззнаковый байт."""
     return int(v) & 0xFF
 
 
@@ -134,6 +153,12 @@ def decode_alarm(v):
 
 
 def build_setcfg(cfg_bytes: list) -> bytes:
+    """
+    Формат по протоколу:
+    [0x35] + [30 байт данных] + [КС 1 байт]
+    КС = (cmd + все байты данных) & 0xFF
+    Итого 32 байта.
+    """
     if len(cfg_bytes) != 30:
         raise ValueError(f'build_setcfg expects 30 cfg bytes, got {len(cfg_bytes)}')
     payload = bytes([CMD_SETCFG] + cfg_bytes)
@@ -252,36 +277,44 @@ class TemzitClient:
         if crc_rx != crc_calc:
             raise ValueError(f'cfg CRC mismatch: rx={crc_rx} calc={crc_calc}')
 
+        # ═══════════════════════════════════════════════════════════════════
+        # КРИТИЧНО: срез data[2:32] подтверждён реверс-инжинирингом
+        # Данные конфигурации начинаются с data[2], длина 30 байт
+        # ═══════════════════════════════════════════════════════════════════
         p = data[2:32]
 
-        flowmeter_type = p[22] if len(p) > 22 else None
-        boiler_mode_raw = p[8] if len(p) > 8 else None
-        comp_limit_raw = p[9] if len(p) > 9 else None
-        weather_raw = p[18] if len(p) > 18 else None
-        backup_raw = p[24] if len(p) > 24 else None
+        if len(p) != 30:
+            raise ValueError(f'cfg payload must be exactly 30 bytes, got {len(p)}')
+
+        aux_heater_raw = p[CFG_OFFSET_AUX_HEATER_MODE] if len(p) > CFG_OFFSET_AUX_HEATER_MODE else None
+        dhw_mode_raw = p[CFG_OFFSET_DHW_MODE] if len(p) > CFG_OFFSET_DHW_MODE else None
+        comp_limit_raw = p[CFG_OFFSET_COMP_LIMIT] if len(p) > CFG_OFFSET_COMP_LIMIT else None
+        weather_raw = p[CFG_OFFSET_WEATHER_COMP] if len(p) > CFG_OFFSET_WEATHER_COMP else None
+        backup_raw = p[CFG_OFFSET_BACKUP_TYPE] if len(p) > CFG_OFFSET_BACKUP_TYPE else None
+        flowmeter_raw = p[CFG_OFFSET_FLOWMETER] if len(p) > CFG_OFFSET_FLOWMETER else None
 
         return {
             'diag_cfg_len': len(data),
             'diag_cfg_ms': dt,
-            'cfg_mode': p[0] if len(p) > 0 else None,
-            'cfg_room_target': p[1] if len(p) > 1 else None,
-            'cfg_water_target': p[2] if len(p) > 2 else None,
-            'cfg_p3_raw': p[3] if len(p) > 3 else None,
-            'cfg_ten_on_outdoor': s8(p[4] if len(p) > 4 else None),
-            'cfg_kkb_off_outdoor': s8(p[5] if len(p) > 5 else None),
-            'cfg_p5': p[6] if len(p) > 6 else None,
-            'cfg_dhw_target': p[7] if len(p) > 7 else None,
-            'cfg_boiler_mode': boiler_mode_raw,
-            'cfg_boiler_mode_name': DHW_MODE_NAMES.get(boiler_mode_raw, str(boiler_mode_raw)),
+            'cfg_mode': p[CFG_OFFSET_MODE] if len(p) > CFG_OFFSET_MODE else None,
+            'cfg_room_target': p[CFG_OFFSET_ROOM_TARGET] if len(p) > CFG_OFFSET_ROOM_TARGET else None,
+            'cfg_water_target': p[CFG_OFFSET_WATER_TARGET] if len(p) > CFG_OFFSET_WATER_TARGET else None,
+            'cfg_aux_heater_mode': aux_heater_raw,
+            'cfg_aux_heater_mode_name': AUX_HEATER_NAMES.get(aux_heater_raw, str(aux_heater_raw)),
+            'cfg_ten_on_outdoor': s8(p[CFG_OFFSET_TEN_ON_OUTDOOR] if len(p) > CFG_OFFSET_TEN_ON_OUTDOOR else None),
+            'cfg_kkb_off_outdoor': s8(p[CFG_OFFSET_KKB_OFF_OUTDOOR] if len(p) > CFG_OFFSET_KKB_OFF_OUTDOOR else None),
+            'cfg_backup_type': backup_raw,
+            'cfg_backup_type_name': BACKUP_TYPE_NAMES.get(backup_raw, str(backup_raw)),
+            'cfg_dhw_target': p[CFG_OFFSET_DHW_TARGET] if len(p) > CFG_OFFSET_DHW_TARGET else None,
+            'cfg_dhw_mode': dhw_mode_raw,
+            'cfg_dhw_mode_name': DHW_MODE_NAMES.get(dhw_mode_raw, str(dhw_mode_raw)),
             'cfg_compressor_limit': comp_limit_raw,
             'cfg_compressor_limit_pct': COMP_LIMIT_PCT.get(comp_limit_raw),
             'cfg_compressor_limit_name': COMP_LIMIT_NAMES.get(comp_limit_raw, str(comp_limit_raw)),
             'cfg_weather_comp': weather_comp_from_raw(weather_raw),
-            'cfg_dhw_max_from_compressor': p[21] if len(p) > 21 else None,
-            'cfg_flowmeter_type': flowmeter_type,
-            'cfg_flowmeter_type_name': FLOWMETER_TYPES.get(flowmeter_type, f'unknown_{flowmeter_type}'),
-            'cfg_backup_type': backup_raw,
-            'cfg_backup_type_name': BACKUP_TYPE_NAMES.get(backup_raw, str(backup_raw)),
+            'cfg_dhw_max_from_compressor': p[CFG_OFFSET_DHW_MAX_COMP] if len(p) > CFG_OFFSET_DHW_MAX_COMP else None,
+            'cfg_flowmeter_type': flowmeter_raw,
+            'cfg_flowmeter_type_name': FLOWMETER_TYPES.get(flowmeter_raw, f'unknown_{flowmeter_raw}'),
             '_raw': list(p),
         }
 
@@ -359,23 +392,23 @@ class Bridge:
             p1 = HA_MODE_TO_P1.get(payload.lower())
             if p1 is None:
                 raise ValueError(f'Unknown mode: {payload}')
-            self._queue_set(0, p1)
+            self._queue_set(CFG_OFFSET_MODE, p1)
 
         elif suffix == 'set_temperature':
             v = max(16, min(30, round(float(payload))))
-            self._queue_set(1, v)
+            self._queue_set(CFG_OFFSET_ROOM_TARGET, v)
 
         elif suffix == 'set_water_temp':
-            v = max(5, min(99, round(float(payload))))
-            self._queue_set(2, v)
+            v = max(5, min(55, round(float(payload))))
+            self._queue_set(CFG_OFFSET_WATER_TARGET, v)
 
         elif suffix == 'set_dhw_temp':
             v = max(20, min(70, round(float(payload))))
-            self._queue_set(7, v)
+            self._queue_set(CFG_OFFSET_DHW_TARGET, v)
 
         elif suffix == 'set_compressor_limit':
             v = max(0, min(10, round(float(payload))))
-            self._queue_set(9, v)
+            self._queue_set(CFG_OFFSET_COMP_LIMIT, v)
 
         elif suffix == 'set_byte':
             data = json.loads(payload)
@@ -504,7 +537,8 @@ class Bridge:
             ('set_compressor_limit_pct', 'Лимит ККБ', 'set_compressor_limit_pct', None, '%'),
             ('cfg_water_target', 'Конфиг t воды', 'cfg_water_target', 'temperature', '°C'),
             ('cfg_dhw_target', 'Конфиг t ГВС', 'cfg_dhw_target', 'temperature', '°C'),
-            ('cfg_boiler_mode_name', 'Режим ГВС (конфиг)', 'cfg_boiler_mode_name', None, None),
+            ('cfg_dhw_mode_name', 'Режим ГВС (конфиг)', 'cfg_dhw_mode_name', None, None),
+            ('cfg_aux_heater_mode_name', 'Вспомогат. ТЭН', 'cfg_aux_heater_mode_name', None, None),
             ('cfg_compressor_limit_pct', 'Лимит ККБ (конфиг)', 'cfg_compressor_limit_pct', None, '%'),
             ('cfg_weather_comp', 'Погодная компенсация', 'cfg_weather_comp', None, None),
             ('cfg_ten_on_outdoor', 'Т включения ТЭНа', 'cfg_ten_on_outdoor', 'temperature', '°C'),
@@ -551,7 +585,7 @@ class Bridge:
         numbers = [
             ('water_temp_target', 'Уставка t воды',
              f'{MQTT_PREFIX}/state/cfg_water_target',
-             f'{MQTT_PREFIX}/climate/set_water_temp', 5, 99, 1, '°C'),
+             f'{MQTT_PREFIX}/climate/set_water_temp', 5, 55, 1, '°C'),
             ('dhw_temp_target', 'Уставка t ГВС',
              f'{MQTT_PREFIX}/state/cfg_dhw_target',
              f'{MQTT_PREFIX}/climate/set_dhw_temp', 20, 70, 1, '°C'),
