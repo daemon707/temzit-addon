@@ -1,5 +1,5 @@
 name: "Temzit MQTT Bridge"
-version: "0.5.4"
+version: "0.5.5"
 slug: "temzit_mqtt_bridge"
 description: "Local TCP→MQTT bridge for Temzit heat pumps with climate entity and write support"
 url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"
