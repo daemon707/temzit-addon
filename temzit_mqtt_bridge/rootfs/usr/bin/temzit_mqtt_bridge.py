@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.7.1 (read-only, corrected field mapping)
-- Чтение SYNC/CFG по HM_Protocol.pdf
-- CONFIG_MAIN: исправлены смещения и распаковка битовых полей
-- ACTUAL_STATE: исправлены смещения set_room/set_water/set_dhw
-- Режим только чтение: любые команды записи игнорируются
+Temzit MQTT Bridge v0.7.2
+
+- На базе 0.7.1: корректное чтение SYNC/CFG по HM_Protocol
+- ДОБАВЛЕНА безопасная запись: меняем только cfg_dhw_target (уставка ГВС)
+  через MQTT-топик temzit/climate/set_dhw_temp
+- Остальные команды записи по-прежнему игнорируются
 """
-import os, time, json, socket, threading
+import os
+import time
+import json
+import socket
+import threading
+
 import paho.mqtt.client as mqtt
 
 TEMZIT_HOST                 = os.getenv('TEMZIT_HOST', '192.168.2.20')
@@ -24,23 +30,46 @@ MQTT_PREFIX                 = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX       = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID              = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
 
-VERSION = "0.7.1-readonly"
+VERSION = "0.7.2-dhw-write"
 
 CMD_SYNC    = 0x30
 CMD_REQCFG  = 0x34
+CMD_SETCFG  = 0x35
 RESP_ACTUAL = 0x01
 RESP_CONFIG = 0x02
 
-MODE_CODE_TO_HA = {0: 'off', 1: 'heat', 2: 'heat', 3: 'heat', 4: 'cool', 5: 'heat'}
-HA_MODES        = ['off', 'heat', 'cool']
+MODE_CODE_TO_HA = {
+    0: 'off',
+    1: 'heat',
+    2: 'heat',
+    3: 'heat',
+    4: 'cool',
+    5: 'heat',
+}
+HA_MODES = ['off', 'heat', 'cool']
 
-P1_NAMES = {0: 'Стоп', 1: 'Нагрев', 2: 'Быстрый', 3: 'ТЭН', 4: 'Холод', 5: 'Внешний'}
+P1_NAMES = {
+    0: 'Стоп',
+    1: 'Нагрев',
+    2: 'Быстрый',
+    3: 'ТЭН',
+    4: 'Холод',
+    5: 'Внешний',
+}
 
 DHW_MODE_NAMES = {
-    0: 'Выключен', 1: 'Только ТЭН в баке',
-    2: 'ТН 10%',  3: 'ТН 20%',  4: 'ТН 30%',  5: 'ТН 40%',
-    6: 'ТН 50%',  7: 'ТН 60%',  8: 'ТН 70%',  9: 'ТН 80%',
-    10: 'ТН 90%', 11: 'ТН 100%',
+    0: 'Выключен',
+    1: 'Только ТЭН в баке',
+    2: 'ТН 10%',
+    3: 'ТН 20%',
+    4: 'ТН 30%',
+    5: 'ТН 40%',
+    6: 'ТН 50%',
+    7: 'ТН 60%',
+    8: 'ТН 70%',
+    9: 'ТН 80%',
+    10: 'ТН 90%',
+    11: 'ТН 100%',
 }
 
 TEN_MODE_NAMES = {
@@ -53,18 +82,39 @@ TEN_MODE_NAMES = {
 }
 
 COMP_LIMIT_NAMES = {
-    0: 'Без ограничений', 1: '10%', 2: '20%', 3: '30%',
-    4: '40%', 5: '50%', 6: '55%', 7: '60%', 8: '70%', 9: '80%', 10: '90%',
+    0: 'Без ограничений',
+    1: '10%',
+    2: '20%',
+    3: '30%',
+    4: '40%',
+    5: '50%',
+    6: '55%',
+    7: '60%',
+    8: '70%',
+    9: '80%',
+    10: '90%',
 }
 
 COMP_LIMIT_PCT = {
-    0: 0, 1: 10, 2: 20, 3: 30, 4: 40, 5: 50,
-    6: 55, 7: 60, 8: 70, 9: 80, 10: 90,
+    0: 0,
+    1: 10,
+    2: 20,
+    3: 30,
+    4: 40,
+    5: 50,
+    6: 55,
+    7: 60,
+    8: 70,
+    9: 80,
+    10: 90,
 }
 
 BACKUP_TYPE_NAMES = {
-    0: 'Не использовать', 1: 'после I ступени',
-    2: 'после II ступени', 3: 'после III ступени', 4: 'только внешний',
+    0: 'Не использовать',
+    1: 'после I ступени',
+    2: 'после II ступени',
+    3: 'после III ступени',
+    4: 'только внешний',
 }
 
 PUMP_RELAY_NAMES = {
@@ -74,39 +124,54 @@ PUMP_RELAY_NAMES = {
 }
 
 FLOWMETER_TYPES = {
-    0: 'unknown', 1: 'impulse_1l', 2: 'impulse_10l',
-    3: 'dual_channel', 4: 'electronic', 5: 'fixed', 6: 'reed_switch',
+    0: 'unknown',
+    1: 'impulse_1l',
+    2: 'impulse_10l',
+    3: 'dual_channel',
+    4: 'electronic',
+    5: 'fixed',
+    6: 'reed_switch',
 }
 
 ALARM_BITS = {
-    0x0001: 'contactor_fail_e05', 0x0002: 'link_fail_e08',
-    0x0004: 'flow1_fail_e01',     0x0008: 'wifiterm_fail_e07',
-    0x0010: 'tevap_fail_e09',     0x0020: 'tcompover_fail_e02',
-    0x0040: 'tevaplow_fail_e03',  0x0080: 'kkb1_fail_e04',
-    0x0100: 'clock_fail_e06',     0x0200: 'wifi_error_e0A',
-    0x4000: 'crit_tsens_fail',    0x8000: 'lcdversion_fail',
+    0x0001: 'contactor_fail_e05',
+    0x0002: 'link_fail_e08',
+    0x0004: 'flow1_fail_e01',
+    0x0008: 'wifiterm_fail_e07',
+    0x0010: 'tevap_fail_e09',
+    0x0020: 'tcompover_fail_e02',
+    0x0040: 'tevaplow_fail_e03',
+    0x0080: 'kkb1_fail_e04',
+    0x0100: 'clock_fail_e06',
+    0x0200: 'wifi_error_e0A',
+    0x4000: 'crit_tsens_fail',
+    0x8000: 'lcdversion_fail',
 }
 
 
-def s8(v):
-    return None if v is None else (v if v < 128 else v - 256)
+def s8(v: int | None) -> int | None:
+    if v is None:
+        return None
+    return v if v < 128 else v - 256
 
 
-def weather_comp_from_raw(v):
-    return None if v is None else round(v * 0.1, 1)
+def weather_comp_from_raw(v: int | None) -> float | None:
+    if v is None:
+        return None
+    return round(v * 0.1, 1)
 
 
 def checksum16(data: bytes) -> int:
     return sum(data) & 0xFFFF
 
 
-def u16le(buf: bytes, off: int):
+def u16le(buf: bytes, off: int) -> int | None:
     if len(buf) < off + 2:
         return None
     return int.from_bytes(buf[off:off+2], 'little', signed=False)
 
 
-def heater_stage_from_raw(v):
+def heater_stage_from_raw(v: int | None) -> int | None:
     if v is None:
         return None
     if 9 <= v <= 84:
@@ -118,11 +183,13 @@ def heater_stage_from_raw(v):
     return 0
 
 
-def dhw_heater_on(v):
-    return None if v is None else ('ON' if (v & 0x1) else 'OFF')
+def dhw_heater_on(v: int | None) -> str | None:
+    if v is None:
+        return None
+    return 'ON' if (v & 0x1) else 'OFF'
 
 
-def decode_alarm(v):
+def decode_alarm(v: int | None) -> str | None:
     if v is None:
         return None
     names = [name for bit, name in ALARM_BITS.items() if v & bit]
@@ -130,13 +197,13 @@ def decode_alarm(v):
 
 
 class TemzitClient:
-    def __init__(self, host, port, timeout):
+    def __init__(self, host: str, port: int, timeout: int) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.lock = threading.Lock()
 
-    def _query(self, payload: bytes):
+    def _query(self, payload: bytes) -> tuple[bytes, int]:
         with self.lock:
             t0 = time.time()
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
@@ -146,7 +213,7 @@ class TemzitClient:
             dt = round((time.time() - t0) * 1000)
             return data, dt
 
-    def get_sync(self):
+    def get_sync(self) -> dict:
         data, dt = self._query(bytes([CMD_SYNC, 0x00]))
         if len(data) < 64:
             raise ValueError(f'incomplete sync reply: {len(data)} bytes')
@@ -156,9 +223,10 @@ class TemzitClient:
         crc_calc = checksum16(data[:62])
         if crc_rx != crc_calc:
             raise ValueError(f'sync CRC mismatch: rx={crc_rx} calc={crc_calc}')
+
         p = data[2:62]
 
-        def t(off):
+        def t(off: int) -> float | None:
             v = u16le(p, off)
             return None if v is None else v / 10.0
 
@@ -168,9 +236,11 @@ class TemzitClient:
         alarm = u16le(p, 30)
         mode_code = u16le(p, 0)
         power_raw = u16le(p, 28)
+
         compressor_hz_1 = p[22] if len(p) > 22 else None
         compressor_hz_2 = p[23] if len(p) > 23 else None
         compressor_active = 'ON' if (compressor_hz_1 or 0) > 0 or (compressor_hz_2 or 0) > 0 else 'OFF'
+
         set_room = p[49] if len(p) > 49 else None
         set_water = p[50] if len(p) > 50 else None
         set_dhw = p[51] if len(p) > 51 else None
@@ -224,7 +294,7 @@ class TemzitClient:
             'second': p[59] if len(p) > 59 else None,
         }
 
-    def get_cfg(self):
+    def get_cfg(self) -> dict:
         data, dt = self._query(bytes([CMD_REQCFG, 0x00]))
         if len(data) < 64:
             raise ValueError(f'incomplete cfg reply: {len(data)} bytes')
@@ -234,6 +304,8 @@ class TemzitClient:
         crc_calc = checksum16(data[:62])
         if crc_rx != crc_calc:
             raise ValueError(f'cfg CRC mismatch: rx={crc_rx} calc={crc_calc}')
+
+        # CONFIG_MAIN: 30 байт начиная с offset 1
         p = data[1:31]
 
         ten_byte = p[3] if len(p) > 3 else None
@@ -246,6 +318,7 @@ class TemzitClient:
         cfg_dhw_mode = dhw_byte & 0x0F if dhw_byte is not None else None
         cfg_solar_overheat_action = solar_byte & 0x1F if solar_byte is not None else None
         cfg_solar_mode = (solar_byte >> 5) & 0x07 if solar_byte is not None else None
+
         comp_limit_raw = p[9] if len(p) > 9 else None
         weather_raw = p[18] if len(p) > 18 else None
         pump_relay_raw = p[20] if len(p) > 20 else None
@@ -288,9 +361,22 @@ class TemzitClient:
             '_raw': list(p),
         }
 
+    def set_cfg(self, cfg_bytes: list[int]) -> None:
+        """Отправка CONFIG_MAIN (30 байт) командой 0x35."""
+        if len(cfg_bytes) != 30:
+            raise ValueError(f'CONFIG_MAIN must be 30 bytes, got {len(cfg_bytes)}')
+        body = bytes(cfg_bytes)
+        cmd = bytes([CMD_SETCFG])
+        without_kc = cmd + body
+        kc = (sum(without_kc)) & 0xFF
+        with_kc = without_kc + bytes([kc])
+        ks = (sum(with_kc)) & 0xFF
+        packet = with_kc + bytes([ks])
+        self._query(packet)
+
 
 class Bridge:
-    def __init__(self):
+    def __init__(self) -> None:
         self.temzit = TemzitClient(TEMZIT_HOST, TEMZIT_PORT, TEMZIT_TIMEOUT)
         self.client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
         if MQTT_USER:
@@ -298,15 +384,16 @@ class Bridge:
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         self.discovery_sent = False
-        self.last_cfg_poll = 0
-        self.last_sync_ts = 0
+        self.last_cfg_poll = 0.0
+        self.last_sync_ts = 0.0
+        self._last_cfg_raw: list[int] | None = None
 
-    def publish(self, topic, payload, retain=True, qos=0):
+    def publish(self, topic: str, payload, retain: bool = True, qos: int = 0) -> None:
         if not isinstance(payload, str):
             payload = json.dumps(payload, ensure_ascii=False)
         self.client.publish(topic, payload, qos=qos, retain=retain)
 
-    def on_connect(self, client, userdata, flags, rc):
+    def on_connect(self, client, userdata, flags, rc):  # type: ignore[override]
         self.publish(f'{MQTT_PREFIX}/availability', 'online')
         client.subscribe(f'{MQTT_PREFIX}/climate/set_mode')
         client.subscribe(f'{MQTT_PREFIX}/climate/set_temperature')
@@ -315,17 +402,57 @@ class Bridge:
         client.subscribe(f'{MQTT_PREFIX}/climate/set_compressor_limit')
         client.subscribe(f'{MQTT_PREFIX}/cmd/set_byte')
 
-    def on_message(self, client, userdata, msg):
+    def _handle_set_dhw(self, payload: str) -> None:
+        try:
+            temp = float(payload)
+        except ValueError:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {
+                'set_dhw_error': 'invalid_payload',
+                'payload': payload,
+            })
+            return
+
+        if self._last_cfg_raw is None or len(self._last_cfg_raw) != 30:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {
+                'set_dhw_error': 'no_cfg_cache',
+                'payload': payload,
+            })
+            return
+
+        # Температура ГВС в CONFIG_MAIN: байт 7, диапазон 20–70 °C
+        value = int(round(temp))
+        value = max(20, min(70, value))
+        cfg = list(self._last_cfg_raw)
+        cfg[7] = value
+
+        try:
+            self.temzit.set_cfg(cfg)
+            self._last_cfg_raw = cfg
+            self.publish(f'{MQTT_PREFIX}/bridge/info', {
+                'set_dhw_applied_cfg': value,
+            })
+        except Exception as e:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {
+                'set_dhw_error': 'transport',
+                'detail': str(e),
+            })
+
+    def on_message(self, client, userdata, msg):  # type: ignore[override]
         topic = msg.topic
         payload = msg.payload.decode('utf-8', errors='ignore').strip()
+
+        if topic == f'{MQTT_PREFIX}/climate/set_dhw_temp':
+            self._handle_set_dhw(payload)
+            return
+
+        # Остальное пока игнорируем
         self.publish(f'{MQTT_PREFIX}/bridge/error', {
             'readonly_mode': True,
             'ignored_topic': topic,
             'ignored_payload': payload,
         })
-        print(f'READONLY MODE: ignored MQTT command topic={topic} payload={payload}', flush=True)
 
-    def publish_discovery(self):
+    def publish_discovery(self) -> None:
         if self.discovery_sent:
             return
         device = {
@@ -341,28 +468,40 @@ class Bridge:
             'payload_not_available': 'offline',
         }
 
+        # Основной climate (отопление)
         self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_climate/config', {
-            'name': 'Temzit', 'uniq_id': 'temzit_climate',
-            'device': device, **avail,
+            'name': 'Temzit',
+            'uniq_id': 'temzit_climate',
+            'device': device,
+            **avail,
             'curr_temp_t': f'{MQTT_PREFIX}/state/t_room',
             'temp_stat_t': f'{MQTT_PREFIX}/state/climate_target_temp',
             'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_temperature',
-            'temp_step': 1, 'min_temp': 16, 'max_temp': 30,
+            'temp_step': 1,
+            'min_temp': 16,
+            'max_temp': 30,
             'mode_stat_t': f'{MQTT_PREFIX}/state/ha_mode',
             'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode',
-            'modes': HA_MODES, 'precision': 0.1,
+            'modes': HA_MODES,
+            'precision': 0.1,
         })
 
+        # ГВС как отдельный climate
         self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_dhw_climate/config', {
-            'name': 'Temzit ГВС', 'uniq_id': 'temzit_dhw_climate',
-            'device': device, **avail,
+            'name': 'Temzit ГВС',
+            'uniq_id': 'temzit_dhw_climate',
+            'device': device,
+            **avail,
             'curr_temp_t': f'{MQTT_PREFIX}/state/t_dhw',
             'temp_stat_t': f'{MQTT_PREFIX}/state/set_dhw',
             'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_dhw_temp',
-            'temp_step': 1, 'min_temp': 20, 'max_temp': 70,
+            'temp_step': 1,
+            'min_temp': 20,
+            'max_temp': 70,
             'mode_stat_t': f'{MQTT_PREFIX}/state/dhw_ha_mode',
             'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode',
-            'modes': ['off', 'heat'], 'precision': 1,
+            'modes': ['off', 'heat'],
+            'precision': 1,
         })
 
         sensors = [
@@ -438,31 +577,38 @@ class Bridge:
             'device': device,
             **avail,
         })
+
         self.discovery_sent = True
 
-    def _publish_state(self, state):
+    def _publish_state(self, state: dict) -> None:
         mode_code = state.get('mode_code')
         state['ha_mode'] = MODE_CODE_TO_HA.get(mode_code, 'off')
         state['climate_target_temp'] = state.get('set_room')
         if state.get('compressor_active') is None:
             state['compressor_active'] = 'OFF'
         state['dhw_ha_mode'] = 'heat' if state['ha_mode'] != 'off' else 'off'
+
         sync_raw = state.get('_sync_raw')
         if sync_raw is not None:
             self.publish(f'{MQTT_PREFIX}/sync/raw', sync_raw, retain=False)
+
         self.publish(f'{MQTT_PREFIX}/state/json', state)
         for k, v in state.items():
             if v is not None and not k.startswith('_'):
-                self.publish(f'{MQTT_PREFIX}/state/{k}', str(v) if not isinstance(v, (dict, list)) else json.dumps(v))
+                if isinstance(v, (dict, list)):
+                    self.publish(f'{MQTT_PREFIX}/state/{k}', v)
+                else:
+                    self.publish(f'{MQTT_PREFIX}/state/{k}', str(v))
 
-    def _publish_cfg(self, cfg):
+    def _publish_cfg(self, cfg: dict) -> None:
+        self._last_cfg_raw = cfg.get('_raw')
         self.publish(f'{MQTT_PREFIX}/cfg/json', {k: v for k, v in cfg.items() if k != '_raw'})
         self.publish(f'{MQTT_PREFIX}/cfg/raw', cfg.get('_raw'))
         for k, v in cfg.items():
             if v is not None and k != '_raw':
                 self.publish(f'{MQTT_PREFIX}/state/{k}', str(v))
 
-    def maybe_poll_cfg(self):
+    def maybe_poll_cfg(self) -> None:
         if TEMZIT_CFG_INTERVAL <= 0:
             return
         now = time.time()
@@ -479,7 +625,7 @@ class Bridge:
             print(f'CFG ERROR: {ce}', flush=True)
             self.publish(f'{MQTT_PREFIX}/bridge/error', {'cfg_error': str(ce)})
 
-    def loop(self):
+    def loop(self) -> None:
         self.client.will_set(f'{MQTT_PREFIX}/availability', 'offline', retain=True)
         self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.client.loop_start()
