@@ -228,7 +228,7 @@ class TemzitClient:
         if crc_rx != crc_calc:
             raise ValueError(f'cfg CRC mismatch: rx={crc_rx} calc={crc_calc}')
 
-        p = data[3:33]
+        p = data[3:61]
 
         flowmeter_type  = p[21] if len(p) > 21 else None
         boiler_mode_raw = p[7]  if len(p) > 7  else None
