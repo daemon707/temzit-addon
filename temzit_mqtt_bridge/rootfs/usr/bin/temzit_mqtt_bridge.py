@@ -566,6 +566,9 @@ class Bridge:
                 self.publish(f'{MQTT_PREFIX}/availability', 'online')
                 self._publish_state(state)
             except Exception as e:
+                # 0.5.6 
+                print(f"CFG ERROR: {ce}", flush=True)
+                #
                 self.publish(f'{MQTT_PREFIX}/availability', 'degraded')
                 self.publish(f'{MQTT_PREFIX}/bridge/error',
                              {'sync_error': str(e)})
