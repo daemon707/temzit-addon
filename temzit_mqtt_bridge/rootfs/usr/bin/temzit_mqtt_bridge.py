@@ -68,8 +68,21 @@ COMP_LIMIT_NAMES = {0: 'Без ограничений', 1: '10%', 2: '20%', 3: '
 COMP_LIMIT_PCT = {0: 0, 1: 10, 2: 20, 3: 30, 4: 40, 5: 50, 6: 55, 7: 60, 8: 70, 9: 80, 10: 90}
 # Режим внешнего котла (дизель) = offset 8 (бывший backup_type).
 EXTERNAL_BOILER_NAMES = {0: 'Не использовать', 1: 'после I ступени', 2: 'после II ступени', 3: 'после III ступени', 4: 'только внешний'}
-FLOWMETER_TYPES = {0: 'unknown', 1: 'impulse_1l', 2: 'impulse_10l', 3: 'dual_channel', 4: 'electronic', 5: 'fixed', 6: 'reed_switch'}
-ALARM_BITS = {0x0001: 'contactor_fail_e05', 0x0002: 'link_fail_e08', 0x0004: 'flow1_fail_e01', 0x0008: 'wifiterm_fail_e07', 0x0010: 'tevap_fail_e09', 0x0020: 'tcompover_fail_e02', 0x0040: 'tevaplow_fail_e03', 0x0080: 'kkb1_fail_e04', 0x0100: 'clock_fail_e06', 0x0200: 'wifi_error_e0A', 0x4000: 'crit_tsens_fail', 0x8000: 'lcdversion_fail'}
+# Подтверждено по веб-интерфейсу: значение 5 = 'Электронный 4р'. Остальные значения пока не подтверждены замером.
+FLOWMETER_TYPES = {0: 'unknown', 1: 'impulse_1l?', 2: 'impulse_10l?', 3: 'dual_channel?', 4: 'electronic?', 5: 'Электронный 4р', 6: 'reed_switch?'}
+# Коды ошибок по официальному приложению (app.js). Поле аварий 32-битное; биты ККБ2 — старшее слово.
+ALARM_BITS = {
+    0x00000001: 'E05 контактор ТЭН', 0x00000002: 'E08 нет связи с ККБ1', 0x00000004: 'E01 низкий проток канал 1',
+    0x00000008: 'E07 нет связи с WiFi-датчиком', 0x00000010: 'E09 ККБ1 не переключается в нагрев',
+    0x00000020: 'E02 высокая Т фреона газ канал 1', 0x00000040: 'E03 низкая Т фреона жидк канал 1',
+    0x00000080: 'E04 авария ККБ1', 0x00000100: 'E06 сброс часов/расписания',
+    0x00004000: 'E0F критичная неисправность датчика T', 0x00008000: 'E0G неверная прошивка дисплея',
+    0x00020000: 'E18 нет связи с ККБ2', 0x00040000: 'E11 низкий проток канал 2',
+    0x00100000: 'E19 ККБ2 не переключается в нагрев', 0x00200000: 'E12 высокая Т фреона газ канал 2',
+    0x00400000: 'E13 низкая Т фреона жидк канал 2', 0x00800000: 'E14 авария ККБ2',
+}
+# Имена живого состояния (SYNC offset 0), по app.js. Это НЕ конфигурационный режим P1.
+STATE_MODE_NAMES = ['СТОП', 'НАГРЕВ', 'ГВС', 'ТЭН']
 
 
 def s8(v):
@@ -96,6 +109,12 @@ def u16le(buf: bytes, off: int):
     if len(buf) < off + 2:
         return None
     return int.from_bytes(buf[off:off + 2], 'little', signed=False)
+
+
+def u32le(buf: bytes, off: int):
+    if len(buf) < off + 4:
+        return None
+    return int.from_bytes(buf[off:off + 4], 'little', signed=False)
 
 
 def s16le(buf: bytes, off: int):
@@ -212,7 +231,7 @@ class TemzitClient:
         flow_raw = u16le(p, 18)
         heater_state = u16le(p, 24)
         dhw_state = u16le(p, 26)
-        alarm = u16le(p, 30)
+        alarm = u32le(p, 30)
         mode_code = u16le(p, 0)
         power_raw = u16le(p, 28)
         set_compressor_limit_raw = p[52] if len(p) > 52 else None
@@ -224,7 +243,7 @@ class TemzitClient:
         clock = None if None in (hh, mm, ss) else f'{hh:02d}:{mm:02d}:{ss:02d}'
         return {
             'diag_sync_len': len(data), 'diag_sync_ms': dt, '_sync_raw': list(p),
-            'mode_code': mode_code, 'mode_name': P1_NAMES.get(mode_code, f'mode_{mode_code}'),
+            'mode_code': mode_code, 'mode_name': STATE_MODE_NAMES[mode_code & 0xFF] if (mode_code & 0xFF) < len(STATE_MODE_NAMES) else f'mode_{mode_code}',
             'schedule_no': u16le(p, 2), 't_outdoor': t(4), 't_room': t(6), 't_supply': t(8), 't_return': t(10),
             't_freon_gas': t(12), 't_freon_liquid': t(14), 't_dhw': t(16),
             'flow_raw': flow_raw, 'flow_l_min': None if flow_raw is None else round(flow_raw * 4, 2),
@@ -237,10 +256,13 @@ class TemzitClient:
             'fw_major': fw_major, 'fw_minor': fw_minor,
             'fw_version': None if None in (fw_major, fw_minor) else f'{fw_major}.{fw_minor}',
             'active_schedule_no': p[45] if len(p) > 45 else None, 'active_schedule_mode': p[46] if len(p) > 46 else None,
-            'set_room': p[47] if len(p) > 47 else None, 'set_water': p[49] if len(p) > 49 else None, 'set_dhw': p[51] if len(p) > 51 else None,
+            'active_schedule_name': ('Основное' if (p[45] if len(p) > 45 else None) == 0 else f'Расписание {p[45]}') if len(p) > 45 else None,
+            # Эхо активного расписания (подтверждено дампом): Тдома=49, Тводы=50, Тгвс=51, огр.ККБ=52, реж.ТЭНа=53, реж.ГВС=54
+            'set_room': p[49] if len(p) > 49 else None, 'set_water': p[50] if len(p) > 50 else None, 'set_dhw': p[51] if len(p) > 51 else None,
             'set_compressor_limit': set_compressor_limit_raw, 'set_compressor_limit_pct': COMP_LIMIT_PCT.get(set_compressor_limit_raw),
             'set_compressor_limit_name': COMP_LIMIT_NAMES.get(set_compressor_limit_raw, str(set_compressor_limit_raw)),
-            'set_ten_mode': p[53] if len(p) > 53 else None, 'set_dhw_mode': p[54] if len(p) > 54 else None,
+            'set_ten_mode': p[53] if len(p) > 53 else None, 'set_ten_mode_name': TEN_MODE_NAMES.get(p[53] if len(p) > 53 else None, '?'),
+            'set_dhw_mode': p[54] if len(p) > 54 else None,
             'set_dhw_mode_name': DHW_MODE_NAMES.get(p[54] if len(p) > 54 else None, '?'),
             'weekday': p[56] if len(p) > 56 else None, 'hour': hh, 'minute': mm, 'second': ss, 'clock': clock,
         }
@@ -293,7 +315,7 @@ class TemzitClient:
             'cfg_dhw_target': p[7],
             'cfg_external_boiler': external_boiler, 'cfg_external_boiler_name': EXTERNAL_BOILER_NAMES.get(external_boiler, str(external_boiler)),
             'cfg_compressor_limit': comp_limit_raw, 'cfg_compressor_limit_pct': COMP_LIMIT_PCT.get(comp_limit_raw), 'cfg_compressor_limit_name': COMP_LIMIT_NAMES.get(comp_limit_raw, str(comp_limit_raw)),
-            'cfg_elec_pulses': p[17],
+            'cfg_elec_pulses': p[17], 'cfg_elec_pulses_per_kwh': p[17] * 100,  # сверка с веб: 16 -> 1600 имп/кВт·ч
             'cfg_weather_comp': weather_comp_from_raw(weather_raw),
             'cfg_collector_off': collector_off, 'cfg_collector_on': collector_on,
             'cfg_pump_relay_mode': p[20],
@@ -477,6 +499,45 @@ class Bridge:
         avail = {'availability_topic': f'{MQTT_PREFIX}/availability', 'payload_available': 'online', 'payload_not_available': 'offline'}
         self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_climate/config', {'name': 'Temzit', 'uniq_id': 'temzit_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_room', 'temp_stat_t': f'{MQTT_PREFIX}/state/climate_target_temp', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_temperature', 'temp_step': 1, 'min_temp': 16, 'max_temp': 30, 'mode_stat_t': f'{MQTT_PREFIX}/state/ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': HA_MODES, 'precision': 0.1})
         self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_dhw_climate/config', {'name': 'Temzit ГВС', 'uniq_id': 'temzit_dhw_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_dhw', 'temp_stat_t': f'{MQTT_PREFIX}/state/cfg_dhw_target', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_dhw_temp', 'temp_step': 1, 'min_temp': 20, 'max_temp': 70, 'mode_stat_t': f'{MQTT_PREFIX}/state/dhw_ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': ['off', 'heat'], 'precision': 1})
+
+        # Автообнаружение датчиков (read-only): (ключ_топика, имя, единицы, device_class)
+        sensors = [
+            ('t_outdoor', 'Темзит Улица', '°C', 'temperature'),
+            ('t_room', 'Темзит В доме', '°C', 'temperature'),
+            ('t_supply', 'Темзит Подача', '°C', 'temperature'),
+            ('t_return', 'Темзит Обратка', '°C', 'temperature'),
+            ('t_dhw', 'Темзит ГВС', '°C', 'temperature'),
+            ('t_freon_gas', 'Темзит Фреон газ', '°C', 'temperature'),
+            ('t_freon_liquid', 'Темзит Фреон жидкость', '°C', 'temperature'),
+            ('power_kw', 'Темзит Потребление', 'kW', 'power'),
+            ('compressor_hz_1', 'Темзит Компрессор частота', 'Hz', 'frequency'),
+            ('flow_l_min', 'Темзит Проток', 'L/min', None),
+            ('mode_name', 'Темзит Состояние', None, None),
+            ('compressor_active', 'Темзит Компрессор', None, None),
+            ('alarm_text', 'Темзит Авария', None, None),
+            ('fw_version', 'Темзит Версия ПО', None, None),
+            ('active_schedule_name', 'Темзит Активное расписание', None, None),
+            ('set_room', 'Темзит Уставка дома (активн.)', '°C', 'temperature'),
+            ('set_water', 'Темзит Уставка воды (активн.)', '°C', 'temperature'),
+            ('set_dhw', 'Темзит Уставка ГВС (активн.)', '°C', 'temperature'),
+            ('cfg_room_target', 'Темзит Уставка дома', '°C', 'temperature'),
+            ('cfg_water_target', 'Темзит Уставка воды', '°C', 'temperature'),
+            ('cfg_dhw_target', 'Темзит Уставка ГВС (конфиг)', '°C', 'temperature'),
+            ('cfg_dhw_mode_name', 'Темзит Режим ГВС', None, None),
+            ('cfg_ten_mode_name', 'Темзит Режим ТЭНа', None, None),
+            ('cfg_external_boiler_name', 'Темзит Внешний котёл', None, None),
+            ('cfg_compressor_limit_name', 'Темзит Ограничение ККБ', None, None),
+            ('cfg_weather_comp', 'Темзит Погодокомпенсация', None, None),
+        ]
+        for key, name, unit, dev_cla in sensors:
+            cfg = {'name': name, 'uniq_id': f'temzit_{key}', 'device': device, **avail,
+                   'stat_t': f'{MQTT_PREFIX}/state/{key}'}
+            if unit:
+                cfg['unit_of_meas'] = unit
+                cfg['stat_cla'] = 'measurement'
+            if dev_cla:
+                cfg['dev_cla'] = dev_cla
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{key}/config', cfg)
         self.discovery_sent = True
 
     def _publish_state(self, state: dict):
