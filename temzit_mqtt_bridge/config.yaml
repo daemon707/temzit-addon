@@ -1,5 +1,5 @@
 name: "Temzit MQTT Bridge"
-version: "0.8.2"
+version: "0.8.3"
 slug: "temzit_mqtt_bridge"
 description: "Local TCP→MQTT bridge for Temzit heat pumps with climate entity and safe write (mandatory config backups)"
 url: "https://github.com/daemon707/temzit-addon/tree/main/temzit_mqtt_bridge"
@@ -21,6 +21,7 @@ options:
   temzit_cfg_delay_after_sync: 12
   temzit_retry_delay: 15
   data_dir: "/share/temzit"
+  write_enabled: false
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_user: ""
@@ -37,6 +38,7 @@ schema:
   temzit_cfg_delay_after_sync: int?
   temzit_retry_delay: int?
   data_dir: str?
+  write_enabled: bool?
   mqtt_host: str
   mqtt_port: int?
   mqtt_user: str?

@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.2 (SAFE-WRITE)
-Изменения 0.8.2 (КРИТИЧНО — починка кадра записи):
+Temzit MQTT Bridge v0.8.3 (WRITE DISABLED BY DEFAULT)
+Изменения 0.8.3: запись ВЫКЛЮЧЕНА по умолчанию (write_enabled=false / TEMZIT_WRITE_ENABLED).
+Причина: кадр записи 0x35 НЕ подтверждён на железе — две попытки (0.8.1 без паддинга и 0.8.2 с
+паддингом) исказили конфиг контроллера по-разному. До выяснения точного кадра все команды записи
+(set_*, set_byte, restore_raw) игнорируются с уведомлением в MQTT. Чтение работает как прежде.
+Менять настройки — с панели ГМ; восстановление из бэкапа — docs/temzit_restore.py (тоже под
+вопросом по кадру) либо вручную.
+
+Изменения 0.8.2 (попытка починки кадра записи — НЕ подтверждена):
 - build_setcfg: кадр записи теперь 0x35 + 0x00(паддинг) + 30 байт + КС = 33 байта. Раньше
   паддинга не было -> контроллер писал ВСЕ параметры со сдвигом на 1 байт (подтверждено по
   дисплею ГМ). Это первый реальный тест записи на железе.
@@ -57,7 +64,11 @@ MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
 # из запасных вариантов (resolve_writable_dir), чтобы файлы НИКОГДА не падали в '/', откуда их не
 # достать. Бэкапы НАКАПЛИВАЮТСЯ (уникальные имена + append-журнал), не перезаписываются.
 TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
-VERSION = '0.8.2'
+# KILL-SWITCH ЗАПИСИ. Кадр записи 0x35 пока НЕ подтверждён на железе (две попытки исказили
+# конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
+# случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
+WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+VERSION = '0.8.3'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -488,6 +499,10 @@ class Bridge:
             self._restore_cfg(raw)
 
     def _queue_set(self, offset: int, value: int):
+        if not WRITE_ENABLED:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'write_disabled': 'Запись отключена (write_enabled=false): кадр 0x35 не подтверждён на железе. Меняй настройки с панели ГМ.', 'offset': offset, 'value': value})
+            print(f'WRITE DISABLED: игнорирую set offset={offset} value={value}', flush=True)
+            return
         with self._set_lock:
             self._pending_set[offset] = value
         self._flush_pending_set()
@@ -608,6 +623,10 @@ class Bridge:
         """Полное восстановление 30 байт конфигурации (например, из бэкапа). В отличие от
         обычной записи — БЕЗ дедупликации (всегда пишем), т.к. цель именно перезаписать конфиг
         устройства целиком. Бэкап текущего состояния и валидация результата обязательны."""
+        if not WRITE_ENABLED:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'write_disabled': 'Запись отключена (write_enabled=false): кадр 0x35 не подтверждён на железе. Восстанавливай с панели ГМ или docs/temzit_restore.py.'})
+            print('WRITE DISABLED: игнорирую restore_raw', flush=True)
+            return
         if not isinstance(raw, list) or len(raw) != 30:
             self.publish(f'{MQTT_PREFIX}/bridge/error', {'restore_error': f'нужно ровно 30 байт, получено {len(raw) if hasattr(raw, "__len__") else "?"}'})
             return
@@ -777,6 +796,7 @@ class Bridge:
             print('FATAL: temzit_host не задан. Укажите IP гидромодуля ТЭМЗИТ (порт 333).', flush=True)
             raise SystemExit(1)
         print(f'Connecting to MQTT {MQTT_HOST}:{MQTT_PORT}, Temzit {TEMZIT_HOST}:{TEMZIT_PORT}', flush=True)
+        print(f'WRITE_ENABLED={WRITE_ENABLED} (запись {"РАЗРЕШЕНА" if WRITE_ENABLED else "ВЫКЛЮЧЕНА — кадр 0x35 не подтверждён"})', flush=True)
         self.client.will_set(f'{MQTT_PREFIX}/availability', 'offline', retain=True)
         self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.client.loop_start()
