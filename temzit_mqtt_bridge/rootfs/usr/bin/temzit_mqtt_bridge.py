@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.7.2 (READ-FIXED)
+Temzit MQTT Bridge v0.7.3 (READ-FIXED)
 Изменения относительно 0.7.1 (ТОЛЬКО чтение/расшифровка и транспорт, ЗАПИСЬ НЕ ТРОНУТА):
 - Транспорт: сокет дочитывается ровно до 64 байт (раньше один recv мог вернуть
   частичный ответ -> "сдвинутый буфер" и ложные set_guard:blocked).
@@ -32,7 +32,7 @@ MQTT_PASS = os.getenv('MQTT_PASS', '')
 MQTT_PREFIX = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
-VERSION = '0.7.2'
+VERSION = '0.7.3'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -497,8 +497,8 @@ class Bridge:
             return
         device = {'identifiers': ['temzit_hp_1'], 'name': 'Temzit Heat Pump', 'manufacturer': 'ТЭМЗИТ', 'model': 'Hydromodule', 'sw_version': VERSION}
         avail = {'availability_topic': f'{MQTT_PREFIX}/availability', 'payload_available': 'online', 'payload_not_available': 'offline'}
-        self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_climate/config', {'name': 'Temzit', 'uniq_id': 'temzit_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_room', 'temp_stat_t': f'{MQTT_PREFIX}/state/climate_target_temp', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_temperature', 'temp_step': 1, 'min_temp': 16, 'max_temp': 30, 'mode_stat_t': f'{MQTT_PREFIX}/state/ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': HA_MODES, 'precision': 0.1})
-        self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_dhw_climate/config', {'name': 'Temzit ГВС', 'uniq_id': 'temzit_dhw_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_dhw', 'temp_stat_t': f'{MQTT_PREFIX}/state/cfg_dhw_target', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_dhw_temp', 'temp_step': 1, 'min_temp': 20, 'max_temp': 70, 'mode_stat_t': f'{MQTT_PREFIX}/state/dhw_ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': ['off', 'heat'], 'precision': 1})
+        self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_climate/config', {'name': 'Temzit', 'uniq_id': 'temzit_climate', 'obj_id': 'temzit_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_room', 'temp_stat_t': f'{MQTT_PREFIX}/state/climate_target_temp', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_temperature', 'temp_step': 1, 'min_temp': 16, 'max_temp': 30, 'mode_stat_t': f'{MQTT_PREFIX}/state/ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': HA_MODES, 'precision': 0.1})
+        self.publish(f'{MQTT_DISCOVERY_PREFIX}/climate/temzit_dhw_climate/config', {'name': 'Temzit ГВС', 'uniq_id': 'temzit_dhw_climate', 'obj_id': 'temzit_dhw_climate', 'device': device, **avail, 'curr_temp_t': f'{MQTT_PREFIX}/state/t_dhw', 'temp_stat_t': f'{MQTT_PREFIX}/state/cfg_dhw_target', 'temp_cmd_t': f'{MQTT_PREFIX}/climate/set_dhw_temp', 'temp_step': 1, 'min_temp': 20, 'max_temp': 70, 'mode_stat_t': f'{MQTT_PREFIX}/state/dhw_ha_mode', 'mode_cmd_t': f'{MQTT_PREFIX}/climate/set_mode', 'modes': ['off', 'heat'], 'precision': 1})
 
         # Автообнаружение датчиков (read-only): (ключ_топика, имя, единицы, device_class)
         sensors = [
@@ -520,6 +520,9 @@ class Bridge:
             ('set_room', 'Темзит Уставка дома (активн.)', '°C', 'temperature'),
             ('set_water', 'Темзит Уставка воды (активн.)', '°C', 'temperature'),
             ('set_dhw', 'Темзит Уставка ГВС (активн.)', '°C', 'temperature'),
+            ('set_ten_mode_name', 'Темзит Расписание режим ТЭНа', None, None),
+            ('set_dhw_mode_name', 'Темзит Расписание режим ГВС', None, None),
+            ('set_compressor_limit_name', 'Темзит Расписание огранич. ККБ', None, None),
             ('cfg_room_target', 'Темзит Уставка дома', '°C', 'temperature'),
             ('cfg_water_target', 'Темзит Уставка воды', '°C', 'temperature'),
             ('cfg_dhw_target', 'Темзит Уставка ГВС (конфиг)', '°C', 'temperature'),
@@ -530,7 +533,7 @@ class Bridge:
             ('cfg_weather_comp', 'Темзит Погодокомпенсация', None, None),
         ]
         for key, name, unit, dev_cla in sensors:
-            cfg = {'name': name, 'uniq_id': f'temzit_{key}', 'device': device, **avail,
+            cfg = {'name': name, 'uniq_id': f'temzit_{key}', 'obj_id': f'temzit_{key}', 'device': device, **avail,
                    'stat_t': f'{MQTT_PREFIX}/state/{key}'}
             if unit:
                 cfg['unit_of_meas'] = unit
