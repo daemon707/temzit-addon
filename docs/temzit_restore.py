@@ -99,8 +99,10 @@ def main():
     if bad:
         raise SystemExit(f'ОТКАЗ: конфиг не прошёл проверку адекватности ({bad}). Запись отменена.')
 
-    payload = bytes([0x35, 0x00]) + bytes(raw)
-    frame = payload + bytes([sum(payload) & 0xFF])
+    # Кадр записи (подтверждён рабочей командой пользователя): 0x35 + config[1..29] + 0xFF + КС.
+    # Режим (offset 0) командой 0x35 НЕ пишется — он управляется с панели ГМ.
+    body = bytes([0x35] + [b & 0xFF for b in raw[1:30]] + [0xFF])
+    frame = body + bytes([sum(body) & 0xFF])
 
     print(f'Хост:   {args.host}:{args.port}')
     print(f'Конфиг: {bytes(raw).hex()}')
@@ -119,10 +121,12 @@ def main():
     got = list(resp[2:32])
     print(f'Прочитано: {bytes(got).hex()}')
     print(f'Ожидалось: {bytes(raw).hex()}')
-    if got == raw:
-        print('РЕЗУЛЬТАТ: СОВПАЛО — настройки восстановлены ✔')
+    # Сверяем только offset 1..29 — Режим (offset 0) командой 0x35 не пишется.
+    diff = [(i, raw[i], got[i]) for i in range(1, 30) if raw[i] != got[i]]
+    if not diff:
+        note = '' if raw[0] == got[0] else f'  (Режим offset0 не менялся: {got[0]}, это норма)'
+        print('РЕЗУЛЬТАТ: СОВПАЛО — настройки восстановлены ✔' + note)
     else:
-        diff = [(i, raw[i], got[i]) for i in range(30) if raw[i] != got[i]]
         print('РЕЗУЛЬТАТ: НЕ совпало ✘  расхождения (offset: ожид -> факт):')
         for i, a, b in diff:
             print(f'  [{i}] {a} -> {b}')

@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.3 (WRITE DISABLED BY DEFAULT)
-Изменения 0.8.3: запись ВЫКЛЮЧЕНА по умолчанию (write_enabled=false / TEMZIT_WRITE_ENABLED).
-Причина: кадр записи 0x35 НЕ подтверждён на железе — две попытки (0.8.1 без паддинга и 0.8.2 с
-паддингом) исказили конфиг контроллера по-разному. До выяснения точного кадра все команды записи
-(set_*, set_byte, restore_raw) игнорируются с уведомлением в MQTT. Чтение работает как прежде.
-Менять настройки — с панели ГМ; восстановление из бэкапа — docs/temzit_restore.py (тоже под
-вопросом по кадру) либо вручную.
+Temzit MQTT Bridge v0.8.4 (WRITE FRAME CONFIRMED)
+Изменения 0.8.4: кадр записи ПОДТВЕРЖДЁН рабочей командой пользователя (nc), байт-в-байт:
+  0x35 + config[1..29] + 0xFF + КС = 32 байта.
+  Команда 0x35 пишет параметры начиная с offset 1 (Тдома); Режим (offset 0) ею НЕ пишется
+  (управляется с панели ГМ) — поэтому set_mode теперь отклоняется с уведомлением.
+  build_setcfg даёт байт-в-байт ту же последовательность, что и рабочая команда (есть тест).
+  Запись по-прежнему ВЫКЛЮЧЕНА по умолчанию (write_enabled=false) — включить осознанно.
+
+История kill-switch (0.8.3): запись отключалась, т.к. кадр был неверен (0.8.1 без паддинга —
+сдвиг на 1 байт; 0.8.2 с паддингом — тоже мимо). Теперь кадр верный.
 
 Изменения 0.8.2 (попытка починки кадра записи — НЕ подтверждена):
 - build_setcfg: кадр записи теперь 0x35 + 0x00(паддинг) + 30 байт + КС = 33 байта. Раньше
@@ -68,7 +71,7 @@ TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
 # конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
 # случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
 WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
-VERSION = '0.8.3'
+VERSION = '0.8.4'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -210,14 +213,16 @@ def resolve_writable_dir(preferred):
 def build_setcfg(cfg_bytes: list) -> bytes:
     if len(cfg_bytes) != 30:
         raise ValueError(f'build_setcfg expects 30 cfg bytes, got {len(cfg_bytes)}')
-    # Кадр записи ЗЕРКАЛИТ кадр чтения: после команды идёт байт-паддинг 0x00, и массив настроек
-    # начинается с позиции [2] (в ответах 0x01/0x02 data[1]=0x00, массив тоже с data[2]).
-    # БЕЗ этого паддинга контроллер читал настройки со СДВИГОМ на 1 байт — подтверждено по
-    # дисплею ГМ (все параметры уехали на одну позицию). Итог: 0x35 + 0x00 + 30 байт + КС = 33.
-    # КС — 1 байт, сумма всех байт включая cmd и паддинг (паддинг 0x00 на сумму не влияет).
-    payload = bytes([CMD_SETCFG, 0x00] + [u8(x) for x in cfg_bytes])
-    crc = sum(payload) & 0xFF
-    return payload + bytes([crc])
+    # ПОДТВЕРЖДЕНО рабочей командой пользователя (nc), байт-в-байт:
+    #   кадр = 0x35 + <config[1..29]> + 0xFF + КС = 32 байта.
+    # Команда 0x35 пишет параметры НАЧИНАЯ С offset 1 (Тдома); Режим (offset 0) этим кадром
+    # НЕ пишется (управляется с панели/иначе). Полезная нагрузка — 30 байт: настройки offset
+    # 1..29 (29 байт) + один резервный байт 0xFF (offset 30). КС — 1 байт, сумма всех байт
+    # включая cmd. Прежние версии включали offset 0 в начало → всё уезжало на байт.
+    payload = [u8(x) for x in cfg_bytes[1:30]] + [0xFF]
+    frame = bytes([CMD_SETCFG] + payload)
+    crc = sum(frame) & 0xFF
+    return frame + bytes([crc])
 
 
 def looks_like_valid_cfg(cfg_raw):
@@ -477,10 +482,10 @@ class Bridge:
     def _handle_cmd(self, topic, payload):
         suffix = topic.split('/')[-1]
         if suffix == 'set_mode':
-            p1 = HA_MODE_TO_P1.get(payload.lower())
-            if p1 is None:
-                raise ValueError(f'Unknown mode: {payload}')
-            self._queue_set(CFG_OFFSET_MODE, p1)
+            # Режим (offset 0) командой 0x35 НЕ пишется (подтверждено форматом кадра) — он
+            # управляется с панели ГМ. Не делаем бесполезную запись, сообщаем причину.
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_mode_unsupported': 'Режим (offset 0) не пишется командой 0x35 — переключай его на панели гидромодуля.', 'payload': payload})
+            print(f'set_mode не поддержан протоколом записи: {payload}', flush=True)
         elif suffix == 'set_temperature':
             self._queue_set(CFG_OFFSET_ROOM_TARGET, max(16, min(30, round(float(payload)))))
         elif suffix == 'set_water_temp':
