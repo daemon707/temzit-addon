@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.1 (SAFE-WRITE)
+Temzit MQTT Bridge v0.8.2 (SAFE-WRITE)
+Изменения 0.8.2 (КРИТИЧНО — починка кадра записи):
+- build_setcfg: кадр записи теперь 0x35 + 0x00(паддинг) + 30 байт + КС = 33 байта. Раньше
+  паддинга не было -> контроллер писал ВСЕ параметры со сдвигом на 1 байт (подтверждено по
+  дисплею ГМ). Это первый реальный тест записи на железе.
+- Команда cmd/restore_raw: полное восстановление 30 байт из бэкапа одним сообщением
+  (список или hex), без дедупликации, с обязательным бэкапом и валидацией.
+
 Изменения 0.8.1: MQTT-клиент создаётся совместимо с paho-mqtt 1.x и 2.x (make_mqtt_client);
 понятная диагностика при незаполненных mqtt_host/temzit_host вместо тёмной ошибки сокета.
 
@@ -50,7 +57,7 @@ MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
 # из запасных вариантов (resolve_writable_dir), чтобы файлы НИКОГДА не падали в '/', откуда их не
 # достать. Бэкапы НАКАПЛИВАЮТСЯ (уникальные имена + append-журнал), не перезаписываются.
 TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
-VERSION = '0.8.1'
+VERSION = '0.8.2'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -192,7 +199,12 @@ def resolve_writable_dir(preferred):
 def build_setcfg(cfg_bytes: list) -> bytes:
     if len(cfg_bytes) != 30:
         raise ValueError(f'build_setcfg expects 30 cfg bytes, got {len(cfg_bytes)}')
-    payload = bytes([CMD_SETCFG] + [u8(x) for x in cfg_bytes])
+    # Кадр записи ЗЕРКАЛИТ кадр чтения: после команды идёт байт-паддинг 0x00, и массив настроек
+    # начинается с позиции [2] (в ответах 0x01/0x02 data[1]=0x00, массив тоже с data[2]).
+    # БЕЗ этого паддинга контроллер читал настройки со СДВИГОМ на 1 байт — подтверждено по
+    # дисплею ГМ (все параметры уехали на одну позицию). Итог: 0x35 + 0x00 + 30 байт + КС = 33.
+    # КС — 1 байт, сумма всех байт включая cmd и паддинг (паддинг 0x00 на сумму не влияет).
+    payload = bytes([CMD_SETCFG, 0x00] + [u8(x) for x in cfg_bytes])
     crc = sum(payload) & 0xFF
     return payload + bytes([crc])
 
@@ -441,6 +453,7 @@ class Bridge:
         client.subscribe(f'{MQTT_PREFIX}/climate/set_dhw_temp')
         client.subscribe(f'{MQTT_PREFIX}/climate/set_compressor_limit')
         client.subscribe(f'{MQTT_PREFIX}/cmd/set_byte')
+        client.subscribe(f'{MQTT_PREFIX}/cmd/restore_raw')
 
     def on_message(self, client, userdata, msg):
         topic = msg.topic
@@ -468,6 +481,11 @@ class Bridge:
         elif suffix == 'set_byte':
             data = json.loads(payload)
             self._queue_set(int(data['offset']), int(data['value']))
+        elif suffix == 'restore_raw':
+            # Полное восстановление 30 байт: список целых [..30..] или hex-строка (60 символов).
+            data = json.loads(payload)
+            raw = list(bytes.fromhex(data)) if isinstance(data, str) else [int(x) for x in data]
+            self._restore_cfg(raw)
 
     def _queue_set(self, offset: int, value: int):
         with self._set_lock:
@@ -585,6 +603,36 @@ class Bridge:
         self.publish(f'{MQTT_PREFIX}/diag/backup', {'path': path, 'history': hist, 'ts': rec['ts'], 'reason': reason}, retain=False)
         print(f'CFG backup written: {path}', flush=True)
         return path
+
+    def _restore_cfg(self, raw):
+        """Полное восстановление 30 байт конфигурации (например, из бэкапа). В отличие от
+        обычной записи — БЕЗ дедупликации (всегда пишем), т.к. цель именно перезаписать конфиг
+        устройства целиком. Бэкап текущего состояния и валидация результата обязательны."""
+        if not isinstance(raw, list) or len(raw) != 30:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'restore_error': f'нужно ровно 30 байт, получено {len(raw) if hasattr(raw, "__len__") else "?"}'})
+            return
+        raw = [u8(x) for x in raw]
+        ok, reason = looks_like_valid_cfg(raw)
+        if not ok:
+            self.publish(f'{MQTT_PREFIX}/diag/set_guard', {'status': 'restore_rejected', 'reason': reason, 'raw': raw}, retain=False)
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'restore_error': f'невалидный конфиг: {reason}'})
+            return
+        # Бэкап текущего (возможно повреждённого) состояния устройства перед восстановлением.
+        try:
+            backup_path = self._backup_cfg(self._last_cfg_raw or raw, reason='pre_restore', new_cfg=raw)
+        except Exception as be:
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'restore_error': f'бэкап не удался, восстановление отменено: {be}'})
+            return
+        self.publish(f'{MQTT_PREFIX}/diag/set_guard', {'status': 'restoring', 'raw': raw, 'backup': backup_path}, retain=False)
+        try:
+            result = self.temzit.set_cfg(raw, {})  # пишем ровно raw (build_setcfg(raw))
+            result['backup'] = backup_path
+            self.publish(f'{MQTT_PREFIX}/diag/last_set', result, retain=False)
+            print(f'restore OK (backup={backup_path})', flush=True)
+            threading.Timer(2.0, self._force_sync_and_cfg).start()
+        except Exception as e:
+            print(f'restore ERROR: {e}', flush=True)
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'restore_error': str(e)})
 
     def _force_cfg_then_flush(self):
         now = time.time()
