@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.4 (WRITE FRAME CONFIRMED)
-Изменения 0.8.4: кадр записи ПОДТВЕРЖДЁН рабочей командой пользователя (nc), байт-в-байт:
-  0x35 + config[1..29] + 0xFF + КС = 32 байта.
-  Команда 0x35 пишет параметры начиная с offset 1 (Тдома); Режим (offset 0) ею НЕ пишется
-  (управляется с панели ГМ) — поэтому set_mode теперь отклоняется с уведомлением.
-  build_setcfg даёт байт-в-байт ту же последовательность, что и рабочая команда (есть тест).
-  Запись по-прежнему ВЫКЛЮЧЕНА по умолчанию (write_enabled=false) — включить осознанно.
+Temzit MQTT Bridge v0.8.5 (WRITE TRANSPORT FIX — CANDIDATE)
+Изменения 0.8.5: байты кадра записи верны (= рабочей nc-команде), НО запись из аддона давала
+сдвиг на 2 байта, а та же команда через `nc` — нет. Единственное отличие — транспорт: `nc`
+после отправки делает полузакрытие (FIN), а питон-сокет нет. Добавлено s.shutdown(SHUT_WR)
+после sendall в set_cfg (кандидатный фикс, НЕ подтверждён на железе). Запись ОСТАЁТСЯ выключенной
+по умолчанию (write_enabled=false) — проверять осторожно, держа рабочую nc-команду как откат.
+
+Кадр (подтверждён nc, v0.8.4): 0x35 + config[1..29] + 0xFF + КС = 32 байта. Режим (offset 0)
+командой 0x35 не пишется (только панель ГМ); set_mode отклоняется.
 
 История kill-switch (0.8.3): запись отключалась, т.к. кадр был неверен (0.8.1 без паддинга —
 сдвиг на 1 байт; 0.8.2 с паддингом — тоже мимо). Теперь кадр верный.
@@ -71,7 +73,7 @@ TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
 # конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
 # случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
 WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
-VERSION = '0.8.4'
+VERSION = '0.8.5'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -399,7 +401,6 @@ class TemzitClient:
             '_raw': p,
         }
 
-    # --- БЛОК ЗАПИСИ — НЕ ИЗМЕНЯТЬ ---
     def set_cfg(self, cfg_raw: list, updates: dict) -> dict:
         new_cfg = list(cfg_raw)
         for offset, value in updates.items():
@@ -412,6 +413,13 @@ class TemzitClient:
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
                 s.settimeout(self.timeout)
                 s.sendall(packet)
+                # КАНДИДАТНЫЙ ФИКС: полузакрытие записи (FIN), как делает `printf | nc`. Без него
+                # питон-сокет давал сдвиг на 2 байта при идентичных байтах кадра (nc — нет).
+                # Гипотеза: контроллер дочитывает запрос до FIN. Не подтверждено на железе.
+                try:
+                    s.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
                 try:
                     resp = s.recv(64)
                     print(f'set_cfg response ({len(resp)} bytes): {list(resp)}', flush=True)

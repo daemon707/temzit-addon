@@ -57,13 +57,20 @@ def validate(raw):
     return None
 
 
-def query(host, port, timeout, frame, expect_type, what, retries=5, retry_delay=15):
+def query(host, port, timeout, frame, expect_type, what, retries=5, retry_delay=15, half_close=False):
     last = None
     for attempt in range(1, retries + 1):
         try:
             with socket.create_connection((host, port), timeout=timeout) as s:
                 s.settimeout(timeout)
                 s.sendall(frame)
+                if half_close:
+                    # Полузакрытие записи (FIN), как делает `printf | nc` — иначе питон-сокет
+                    # давал сдвиг кадра записи на 2 байта (см. кандидатный фикс в мосте).
+                    try:
+                        s.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                 resp = bytearray()
                 while len(resp) < EXPECTED_LEN:
                     chunk = s.recv(EXPECTED_LEN - len(resp))
@@ -113,7 +120,7 @@ def main():
             raise SystemExit('Отменено пользователем.')
 
     print('Пишу конфиг (0x35)...')
-    query(args.host, args.port, args.timeout, frame, 0x01, 'запись')
+    query(args.host, args.port, args.timeout, frame, 0x01, 'запись', half_close=True)
     print('Запись принята (ACTUAL_STATE). Жду 12с и читаю обратно (0x34)...')
     time.sleep(12)
 
