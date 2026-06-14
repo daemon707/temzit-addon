@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.7.1 SAFE
-- Чтение cfg: data[2:32]
-- Маппинг параметров по подтверждённому реверс-инжинирингу: P1..P9/P88
-- Защита от сдвинутого буфера: перед set_cfg запрещается отправка cfg_raw,
-  если первый байт не похож на mode (0..5)
-- Используется last_good_cfg_raw как эталон записи
-- Публикуется диагностический топик temzit/diag/set_guard
+Temzit MQTT Bridge v0.7.2 (READ-FIXED)
+Изменения относительно 0.7.1 (ТОЛЬКО чтение/расшифровка и транспорт, ЗАПИСЬ НЕ ТРОНУТА):
+- Транспорт: сокет дочитывается ровно до 64 байт (раньше один recv мог вернуть
+  частичный ответ -> "сдвинутый буфер" и ложные set_guard:blocked).
+- Температуры в SYNC читаются как signed int16 (раньше беззнаково -> -10C давало ~6553C).
+- CFG: исправлена раскладка по подтверждённому дампу + протоколу:
+    * offset 3  = Инерция дома (старший ниббл) + Режим ТЭНа (младший ниббл)
+    * offset 6  = Дезинфекция (старший ниббл) + Режим ГВС (младший ниббл)   <- режим ГВС жил тут, не в offset 8
+    * offset 8  = Режим внешнего котла (дизель)                              <- сюда переехал бывший backup_type
+    * offset 19 = Тколлектор выкл (старший ниббл) + вкл (младший ниббл)
+    * offset 23 = Действия при перегреве СК (5 бит) + Режим СК (3 бита)
+- SYNC: добавлено чтение версии прошивки (offset 43/44) и часов в BCD (offset 57/58/59).
+- Блок записи (build_setcfg / set_cfg / _queue_set / _flush_pending_set / looks_like_valid_cfg
+  / CFG_OFFSET_* и обработчики команд) НАМЕРЕННО оставлен без изменений.
 """
 import os, time, json, socket, threading
 import paho.mqtt.client as mqtt
@@ -25,7 +32,7 @@ MQTT_PASS = os.getenv('MQTT_PASS', '')
 MQTT_PREFIX = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
-VERSION = '0.7.1'
+VERSION = '0.7.2'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -33,6 +40,9 @@ CMD_SETCFG = 0x35
 RESP_ACTUAL = 0x01
 RESP_CONFIG = 0x02
 
+EXPECTED_LEN = 64  # и ACTUAL_STATE, и CONFIG_MAIN — ровно 64 байта
+
+# --- Смещения для ЗАПИСИ (НЕ менять: используются в коде записи и guard) ---
 CFG_OFFSET_MODE = 0
 CFG_OFFSET_ROOM_TARGET = 1
 CFG_OFFSET_WATER_TARGET = 2
@@ -51,11 +61,13 @@ MODE_CODE_TO_HA = {0: 'off', 1: 'heat', 2: 'heat', 3: 'heat', 4: 'cool', 5: 'hea
 HA_MODE_TO_P1 = {'off': 0, 'heat': 1, 'cool': 4}
 HA_MODES = ['off', 'heat', 'cool']
 P1_NAMES = {0: 'Стоп', 1: 'Нагрев', 2: 'Быстрый', 3: 'ТЭН', 4: 'Холод', 5: 'Внешний'}
-AUX_HEATER_NAMES = {64: '0%', 65: '30%', 66: '60%', 67: '100%'}
+# Режим ТЭНа = младший ниббл offset 3 (значения 0..3 -> проценты).
+TEN_MODE_NAMES = {0: '0%', 1: '30%', 2: '60%', 3: '100%'}
 DHW_MODE_NAMES = {0: 'Выключен', 1: 'Только ТЭН в баке', 2: 'ТН 10%', 3: 'ТН 20%', 4: 'ТН 30%', 5: 'ТН 40%', 6: 'ТН 50%', 7: 'ТН 60%', 8: 'ТН 70%', 9: 'ТН 80%', 10: 'ТН 90%', 11: 'ТН 100%'}
 COMP_LIMIT_NAMES = {0: 'Без ограничений', 1: '10%', 2: '20%', 3: '30%', 4: '40%', 5: '50%', 6: '55%', 7: '60%', 8: '70%', 9: '80%', 10: '90%'}
 COMP_LIMIT_PCT = {0: 0, 1: 10, 2: 20, 3: 30, 4: 40, 5: 50, 6: 55, 7: 60, 8: 70, 9: 80, 10: 90}
-BACKUP_TYPE_NAMES = {0: 'Не использовать', 1: 'после I ступени', 2: 'после II ступени', 3: 'после III ступени', 4: 'только внешний'}
+# Режим внешнего котла (дизель) = offset 8 (бывший backup_type).
+EXTERNAL_BOILER_NAMES = {0: 'Не использовать', 1: 'после I ступени', 2: 'после II ступени', 3: 'после III ступени', 4: 'только внешний'}
 FLOWMETER_TYPES = {0: 'unknown', 1: 'impulse_1l', 2: 'impulse_10l', 3: 'dual_channel', 4: 'electronic', 5: 'fixed', 6: 'reed_switch'}
 ALARM_BITS = {0x0001: 'contactor_fail_e05', 0x0002: 'link_fail_e08', 0x0004: 'flow1_fail_e01', 0x0008: 'wifiterm_fail_e07', 0x0010: 'tevap_fail_e09', 0x0020: 'tcompover_fail_e02', 0x0040: 'tevaplow_fail_e03', 0x0080: 'kkb1_fail_e04', 0x0100: 'clock_fail_e06', 0x0200: 'wifi_error_e0A', 0x4000: 'crit_tsens_fail', 0x8000: 'lcdversion_fail'}
 
@@ -66,6 +78,10 @@ def s8(v):
 
 def u8(v):
     return int(v) & 0xFF
+
+
+def bcd(v):
+    return None if v is None else (v >> 4) * 10 + (v & 0x0F)
 
 
 def weather_comp_from_raw(v):
@@ -80,6 +96,11 @@ def u16le(buf: bytes, off: int):
     if len(buf) < off + 2:
         return None
     return int.from_bytes(buf[off:off + 2], 'little', signed=False)
+
+
+def s16le(buf: bytes, off: int):
+    v = u16le(buf, off)
+    return None if v is None else (v - 65536 if v >= 32768 else v)
 
 
 def heater_stage_from_raw(v):
@@ -105,6 +126,9 @@ def decode_alarm(v):
     return 'ok' if not names else ','.join(names)
 
 
+# ============================================================================
+# БЛОК ЗАПИСИ — НЕ ИЗМЕНЯТЬ (оставлен идентично v0.7.1)
+# ============================================================================
 def build_setcfg(cfg_bytes: list) -> bytes:
     if len(cfg_bytes) != 30:
         raise ValueError(f'build_setcfg expects 30 cfg bytes, got {len(cfg_bytes)}')
@@ -135,6 +159,7 @@ def looks_like_valid_cfg(cfg_raw):
     if not (0 <= comp_limit <= 10):
         return False, f'comp_limit={comp_limit}'
     return True, 'ok'
+# ============================================================================
 
 
 class TemzitClient:
@@ -144,19 +169,33 @@ class TemzitClient:
         self.timeout = timeout
         self.lock = threading.Lock()
 
+    @staticmethod
+    def _recv_until(s, n):
+        """Дочитываем поток до n байт (TCP может отдать ответ несколькими сегментами)."""
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = s.recv(n - len(buf))
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)
+
     def _query(self, payload: bytes) -> tuple:
         with self.lock:
             t0 = time.time()
             with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
                 s.settimeout(self.timeout)
                 s.sendall(payload)
-                data = s.recv(256)
+                data = self._recv_until(s, EXPECTED_LEN)
             dt = round((time.time() - t0) * 1000)
             return data, dt
 
     def get_sync(self) -> dict:
         data, dt = self._query(bytes([CMD_SYNC, 0x00]))
-        if len(data) < 64:
+        if len(data) < EXPECTED_LEN:
             raise ValueError(f'incomplete sync reply: {len(data)} bytes')
         if data[0] != RESP_ACTUAL:
             raise ValueError(f'unexpected sync reply type: {data[0]}')
@@ -165,9 +204,11 @@ class TemzitClient:
         if crc_rx != crc_calc:
             raise ValueError(f'sync CRC mismatch: rx={crc_rx} calc={crc_calc}')
         p = data[2:62]
+
         def t(off):
-            v = u16le(p, off)
+            v = s16le(p, off)  # температуры знаковые (улица/фреон могут быть < 0)
             return None if v is None else v / 10.0
+
         flow_raw = u16le(p, 18)
         heater_state = u16le(p, 24)
         dhw_state = u16le(p, 26)
@@ -175,6 +216,12 @@ class TemzitClient:
         mode_code = u16le(p, 0)
         power_raw = u16le(p, 28)
         set_compressor_limit_raw = p[52] if len(p) > 52 else None
+        fw_major = p[43] if len(p) > 43 else None
+        fw_minor = p[44] if len(p) > 44 else None
+        hh = bcd(p[57]) if len(p) > 57 else None
+        mm = bcd(p[58]) if len(p) > 58 else None
+        ss = bcd(p[59]) if len(p) > 59 else None
+        clock = None if None in (hh, mm, ss) else f'{hh:02d}:{mm:02d}:{ss:02d}'
         return {
             'diag_sync_len': len(data), 'diag_sync_ms': dt, '_sync_raw': list(p),
             'mode_code': mode_code, 'mode_name': P1_NAMES.get(mode_code, f'mode_{mode_code}'),
@@ -187,18 +234,20 @@ class TemzitClient:
             'heater_state_raw': heater_state, 'heater_stage': heater_stage_from_raw(heater_state),
             'dhw_heater_state_raw': dhw_state, 'dhw_heater_on': dhw_heater_on(dhw_state),
             'power_kw': None if power_raw is None else round(power_raw / 10.0, 1), 'alarm': alarm, 'alarm_text': decode_alarm(alarm),
+            'fw_major': fw_major, 'fw_minor': fw_minor,
+            'fw_version': None if None in (fw_major, fw_minor) else f'{fw_major}.{fw_minor}',
             'active_schedule_no': p[45] if len(p) > 45 else None, 'active_schedule_mode': p[46] if len(p) > 46 else None,
             'set_room': p[47] if len(p) > 47 else None, 'set_water': p[49] if len(p) > 49 else None, 'set_dhw': p[51] if len(p) > 51 else None,
             'set_compressor_limit': set_compressor_limit_raw, 'set_compressor_limit_pct': COMP_LIMIT_PCT.get(set_compressor_limit_raw),
             'set_compressor_limit_name': COMP_LIMIT_NAMES.get(set_compressor_limit_raw, str(set_compressor_limit_raw)),
             'set_ten_mode': p[53] if len(p) > 53 else None, 'set_dhw_mode': p[54] if len(p) > 54 else None,
             'set_dhw_mode_name': DHW_MODE_NAMES.get(p[54] if len(p) > 54 else None, '?'),
-            'weekday': p[56] if len(p) > 56 else None, 'hour': p[57] if len(p) > 57 else None, 'minute': p[58] if len(p) > 58 else None, 'second': p[59] if len(p) > 59 else None,
+            'weekday': p[56] if len(p) > 56 else None, 'hour': hh, 'minute': mm, 'second': ss, 'clock': clock,
         }
 
     def get_cfg(self) -> dict:
         data, dt = self._query(bytes([CMD_REQCFG, 0x00]))
-        if len(data) < 35:
+        if len(data) < EXPECTED_LEN:
             raise ValueError(f'incomplete cfg reply: {len(data)} bytes')
         if data[0] != RESP_CONFIG:
             raise ValueError(f'unexpected cfg reply type: {data[0]}')
@@ -209,24 +258,57 @@ class TemzitClient:
         p = list(data[2:32])
         if len(p) != 30:
             raise ValueError(f'cfg payload must be exactly 30 bytes, got {len(p)}')
-        aux_heater_raw = p[CFG_OFFSET_AUX_HEATER_MODE]
-        dhw_mode_raw = p[CFG_OFFSET_DHW_MODE]
+
+        # offset 3: инерция дома (hi) + режим ТЭНа (lo)
+        b3 = p[3]
+        house_inertia = b3 >> 4
+        ten_mode = b3 & 0x0F
+        # offset 6: дезинфекция (hi) + режим ГВС (lo)
+        b6 = p[6]
+        disinfection = b6 >> 4
+        dhw_mode = b6 & 0x0F
+        # offset 8: режим внешнего котла (дизель)
+        external_boiler = p[8]
         comp_limit_raw = p[CFG_OFFSET_COMP_LIMIT]
-        weather_raw = p[CFG_OFFSET_WEATHER_COMP] if len(p) > CFG_OFFSET_WEATHER_COMP else None
-        backup_raw = p[CFG_OFFSET_BACKUP_TYPE]
-        flowmeter_raw = p[CFG_OFFSET_FLOWMETER] if len(p) > CFG_OFFSET_FLOWMETER else None
+        weather_raw = p[CFG_OFFSET_WEATHER_COMP]
+        # offset 19: Тколлектор выкл (hi) + вкл (lo)
+        b19 = p[19]
+        collector_off = b19 >> 4
+        collector_on = b19 & 0x0F
+        # offset 23: действия при перегреве СК (5 бит) + режим СК (3 бита)
+        b23 = p[23]
+        sk_overheat_action = b23 >> 3
+        sk_mode = b23 & 0x07
+        flowmeter_raw = p[CFG_OFFSET_FLOWMETER]
+
         return {
             'diag_cfg_len': len(data), 'diag_cfg_ms': dt,
-            'cfg_mode': p[CFG_OFFSET_MODE], 'cfg_room_target': p[CFG_OFFSET_ROOM_TARGET], 'cfg_water_target': p[CFG_OFFSET_WATER_TARGET],
-            'cfg_aux_heater_mode': aux_heater_raw, 'cfg_aux_heater_mode_name': AUX_HEATER_NAMES.get(aux_heater_raw, str(aux_heater_raw)),
-            'cfg_ten_on_outdoor': s8(p[CFG_OFFSET_TEN_ON_OUTDOOR]), 'cfg_kkb_off_outdoor': s8(p[CFG_OFFSET_KKB_OFF_OUTDOOR]),
-            'cfg_backup_type': backup_raw, 'cfg_backup_type_name': BACKUP_TYPE_NAMES.get(backup_raw, str(backup_raw)),
-            'cfg_dhw_target': p[CFG_OFFSET_DHW_TARGET], 'cfg_dhw_mode': dhw_mode_raw, 'cfg_dhw_mode_name': DHW_MODE_NAMES.get(dhw_mode_raw, str(dhw_mode_raw)),
+            'cfg_mode': p[0], 'cfg_mode_name': P1_NAMES.get(p[0], str(p[0])),
+            'cfg_room_target': p[1], 'cfg_water_target': p[2],
+            'cfg_house_inertia': house_inertia,
+            'cfg_ten_mode': ten_mode, 'cfg_ten_mode_name': TEN_MODE_NAMES.get(ten_mode, str(ten_mode)),
+            'cfg_ten_on_outdoor': s8(p[4]), 'cfg_kkb_min_outdoor': s8(p[5]),
+            'cfg_disinfection': disinfection,
+            'cfg_dhw_mode': dhw_mode, 'cfg_dhw_mode_name': DHW_MODE_NAMES.get(dhw_mode, str(dhw_mode)),
+            'cfg_dhw_target': p[7],
+            'cfg_external_boiler': external_boiler, 'cfg_external_boiler_name': EXTERNAL_BOILER_NAMES.get(external_boiler, str(external_boiler)),
             'cfg_compressor_limit': comp_limit_raw, 'cfg_compressor_limit_pct': COMP_LIMIT_PCT.get(comp_limit_raw), 'cfg_compressor_limit_name': COMP_LIMIT_NAMES.get(comp_limit_raw, str(comp_limit_raw)),
-            'cfg_weather_comp': weather_comp_from_raw(weather_raw), 'cfg_dhw_max_from_compressor': p[CFG_OFFSET_DHW_MAX_COMP] if len(p) > CFG_OFFSET_DHW_MAX_COMP else None,
-            'cfg_flowmeter_type': flowmeter_raw, 'cfg_flowmeter_type_name': FLOWMETER_TYPES.get(flowmeter_raw, f'unknown_{flowmeter_raw}'), '_raw': p,
+            'cfg_elec_pulses': p[17],
+            'cfg_weather_comp': weather_comp_from_raw(weather_raw),
+            'cfg_collector_off': collector_off, 'cfg_collector_on': collector_on,
+            'cfg_pump_relay_mode': p[20],
+            'cfg_dhw_max_from_compressor': p[21],
+            'cfg_flowmeter_type': flowmeter_raw, 'cfg_flowmeter_type_name': FLOWMETER_TYPES.get(flowmeter_raw, f'unknown_{flowmeter_raw}'),
+            'cfg_sk_overheat_action': sk_overheat_action, 'cfg_sk_mode': sk_mode,
+            'cfg_ta_overheat_temp': p[24], 'cfg_kkb1_type': p[25],
+            # 10..16 — настройки WiFi-контроллера, менять извне запрещено; отдаём как диагностику
+            'cfg_wifi_bytes': p[10:17],
+            # 26..29 — недокументировано в протоколе, отдаём сырыми для дальнейшего реверса
+            'cfg_undoc_26': p[26], 'cfg_undoc_27': p[27], 'cfg_undoc_28': p[28], 'cfg_undoc_29': p[29],
+            '_raw': p,
         }
 
+    # --- БЛОК ЗАПИСИ — НЕ ИЗМЕНЯТЬ ---
     def set_cfg(self, cfg_raw: list, updates: dict) -> dict:
         new_cfg = list(cfg_raw)
         for offset, value in updates.items():
@@ -423,7 +505,7 @@ class Bridge:
         self.publish(f'{MQTT_PREFIX}/cfg/raw', raw)
         for k, v in cfg.items():
             if v is not None and k != '_raw':
-                self.publish(f'{MQTT_PREFIX}/state/{k}', str(v))
+                self.publish(f'{MQTT_PREFIX}/state/{k}', str(v) if not isinstance(v, (dict, list)) else json.dumps(v))
 
     def maybe_poll_cfg(self):
         if TEMZIT_CFG_INTERVAL <= 0:
@@ -464,6 +546,7 @@ class Bridge:
             except Exception as ce:
                 self.publish(f'{MQTT_PREFIX}/bridge/error', {'cfg_error': str(ce)})
             time.sleep(TEMZIT_SYNC_INTERVAL)
+
 
 if __name__ == '__main__':
     Bridge().loop()
