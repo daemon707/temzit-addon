@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.5 (WRITE TRANSPORT FIX — CANDIDATE)
-Изменения 0.8.5: байты кадра записи верны (= рабочей nc-команде), НО запись из аддона давала
-сдвиг на 2 байта, а та же команда через `nc` — нет. Единственное отличие — транспорт: `nc`
-после отправки делает полузакрытие (FIN), а питон-сокет нет. Добавлено s.shutdown(SHUT_WR)
-после sendall в set_cfg (кандидатный фикс, НЕ подтверждён на железе). Запись ОСТАЁТСЯ выключенной
-по умолчанию (write_enabled=false) — проверять осторожно, держа рабочую nc-команду как откат.
+Temzit MQTT Bridge v0.8.6 (WRITE VIA NC)
+Изменения 0.8.6: запись отправляется через `nc` (netcat-openbsd), а НЕ через питон-сокет.
+По захвату Wireshark питон-сокет с верными байтами кадра давал контроллеру сдвиг на 2 байта
+(контроллер даже не отвечал), а `printf | nc` с теми же байтами пишет верно. Поэтому set_cfg
+буквально пайпит кадр в nc (subprocess). Убран прежний кандидат с shutdown(SHUT_WR).
+Запись ОСТАЁТСЯ выключенной по умолчанию (write_enabled=false) — проверять с nc-откатом наготове.
 
 Кадр (подтверждён nc, v0.8.4): 0x35 + config[1..29] + 0xFF + КС = 32 байта. Режим (offset 0)
 командой 0x35 не пишется (только панель ГМ); set_mode отклоняется.
@@ -47,7 +47,7 @@ Temzit MQTT Bridge v0.8.5 (WRITE TRANSPORT FIX — CANDIDATE)
 - Блок записи (build_setcfg / set_cfg / _queue_set / _flush_pending_set / looks_like_valid_cfg
   / CFG_OFFSET_* и обработчики команд) НАМЕРЕННО оставлен без изменений.
 """
-import os, time, json, socket, threading, datetime
+import os, time, json, socket, threading, datetime, subprocess
 import paho.mqtt.client as mqtt
 
 TEMZIT_HOST = os.getenv('TEMZIT_HOST', '192.168.2.20')
@@ -73,7 +73,7 @@ TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
 # конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
 # случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
 WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
-VERSION = '0.8.5'
+VERSION = '0.8.6'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -409,23 +409,24 @@ class TemzitClient:
             new_cfg[offset] = u8(value)
         packet = build_setcfg(new_cfg)
         print(f'set_cfg packet ({len(packet)} bytes): {list(packet)}', flush=True)
+        # ВАЖНО: запись отправляем через `nc`, а НЕ через питон-сокет. По захвату Wireshark
+        # питон-сокет с идентичными байтами кадра давал контроллеру сдвиг на 2 байта (и контроллер
+        # не отвечал), а `printf | nc` с теми же байтами — пишет верно. Поэтому буквально
+        # повторяем рабочий способ: пайпим кадр в nc (нужен netcat-openbsd в образе).
         with self.lock:
-            with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
-                s.settimeout(self.timeout)
-                s.sendall(packet)
-                # КАНДИДАТНЫЙ ФИКС: полузакрытие записи (FIN), как делает `printf | nc`. Без него
-                # питон-сокет давал сдвиг на 2 байта при идентичных байтах кадра (nc — нет).
-                # Гипотеза: контроллер дочитывает запрос до FIN. Не подтверждено на железе.
-                try:
-                    s.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-                try:
-                    resp = s.recv(64)
-                    print(f'set_cfg response ({len(resp)} bytes): {list(resp)}', flush=True)
-                except Exception as ex:
-                    resp = b''
-                    print(f'set_cfg no response: {ex}', flush=True)
+            try:
+                proc = subprocess.run(
+                    ['nc', '-w', str(self.timeout), self.host, str(self.port)],
+                    input=packet, capture_output=True, timeout=self.timeout + 5)
+                resp = proc.stdout or b''
+                print(f'set_cfg(nc) rc={proc.returncode} response ({len(resp)} bytes): {list(resp)}', flush=True)
+                if proc.stderr:
+                    print(f'set_cfg(nc) stderr: {proc.stderr.decode("utf-8", "ignore").strip()}', flush=True)
+            except FileNotFoundError:
+                raise RuntimeError("'nc' не найден в образе (нужен netcat-openbsd) — запись через nc невозможна")
+            except Exception as ex:
+                print(f'set_cfg(nc) error: {ex}', flush=True)
+                raise
         return {'packet': list(packet), 'response': list(resp), 'cfg_raw': cfg_raw, 'new_cfg': new_cfg, 'updates': updates}
 
 
