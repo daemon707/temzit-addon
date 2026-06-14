@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.7.3 (READ-FIXED)
-Изменения относительно 0.7.1 (ТОЛЬКО чтение/расшифровка и транспорт, ЗАПИСЬ НЕ ТРОНУТА):
+Temzit MQTT Bridge v0.8.1 (SAFE-WRITE)
+Изменения 0.8.1: MQTT-клиент создаётся совместимо с paho-mqtt 1.x и 2.x (make_mqtt_client);
+понятная диагностика при незаполненных mqtt_host/temzit_host вместо тёмной ошибки сокета.
+
+Изменения 0.8.0 относительно 0.7.3 (по явному запросу пользователя — трогаем запись):
+- ОБЯЗАТЕЛЬНЫЙ накопительный бэкап рабочего дампа ПЕРЕД каждой записью (_backup_cfg).
+  Нет успешного бэкапа -> запись ОТМЕНЯЕТСЯ. Файлы пишутся в /share/temzit (доступно
+  пользователю), а не в '/'. Бэкапы не перезаписываются: уникальные cfg_<ts>.json + append-журнал
+  temzit_cfg_history.jsonl.
+- Дедупликация: если результат совпадает с текущим конфигом — запись пропускается (бережём flash).
+- Валидация РЕЗУЛЬТАТА (looks_like_valid_cfg(new_cfg)) до отправки: нереалистичные значения,
+  которые ранее роняли контроллер, отклоняются и НЕ пишутся.
+- Низкоуровневые build_setcfg/set_cfg (КС 1 байт, read-modify-write 30 байт) НЕ изменены.
+
+Базовые изменения 0.7.3 относительно 0.7.1 (чтение/расшифровка и транспорт):
 - Транспорт: сокет дочитывается ровно до 64 байт (раньше один recv мог вернуть
   частичный ответ -> "сдвинутый буфер" и ложные set_guard:blocked).
 - Температуры в SYNC читаются как signed int16 (раньше беззнаково -> -10C давало ~6553C).
@@ -15,7 +28,7 @@ Temzit MQTT Bridge v0.7.3 (READ-FIXED)
 - Блок записи (build_setcfg / set_cfg / _queue_set / _flush_pending_set / looks_like_valid_cfg
   / CFG_OFFSET_* и обработчики команд) НАМЕРЕННО оставлен без изменений.
 """
-import os, time, json, socket, threading
+import os, time, json, socket, threading, datetime
 import paho.mqtt.client as mqtt
 
 TEMZIT_HOST = os.getenv('TEMZIT_HOST', '192.168.2.20')
@@ -32,7 +45,12 @@ MQTT_PASS = os.getenv('MQTT_PASS', '')
 MQTT_PREFIX = os.getenv('MQTT_PREFIX', 'temzit')
 MQTT_DISCOVERY_PREFIX = os.getenv('MQTT_DISCOVERY_PREFIX', 'homeassistant')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'temzit-bridge')
-VERSION = '0.7.3'
+# Каталог для бэкапов конфигурации перед записью. По умолчанию /share/temzit (доступен
+# пользователю через Samba/File editor/SSH). Если он недоступен — выбирается первый записываемый
+# из запасных вариантов (resolve_writable_dir), чтобы файлы НИКОГДА не падали в '/', откуда их не
+# достать. Бэкапы НАКАПЛИВАЮТСЯ (уникальные имена + append-журнал), не перезаписываются.
+TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
+VERSION = '0.8.1'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -143,6 +161,29 @@ def decode_alarm(v):
         return None
     names = [name for bit, name in ALARM_BITS.items() if v & bit]
     return 'ok' if not names else ','.join(names)
+
+
+def resolve_writable_dir(preferred):
+    """Первый каталог, в который реально удаётся писать (создаётся при необходимости).
+    Нужен, чтобы бэкапы не падали в '/', откуда их не достать. Порядок: предпочитаемый ->
+    /share/temzit (доступен пользователю) -> /config/temzit -> /data/temzit (персистентно для
+    аддона) -> ./temzit_backups. Возвращает путь или None, если писать некуда."""
+    candidates = []
+    for d in [preferred, '/share/temzit', '/config/temzit', '/data/temzit',
+              os.path.join(os.getcwd(), 'temzit_backups')]:
+        if d and d not in candidates:
+            candidates.append(d)
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, '.write_test')
+            with open(probe, 'w') as f:
+                f.write('ok')
+            os.remove(probe)
+            return d
+        except Exception:
+            continue
+    return None
 
 
 # ============================================================================
@@ -352,10 +393,23 @@ class TemzitClient:
         return {'packet': list(packet), 'response': list(resp), 'cfg_raw': cfg_raw, 'new_cfg': new_cfg, 'updates': updates}
 
 
+def make_mqtt_client():
+    """Создаёт MQTT-клиент совместимо с paho-mqtt 1.x и 2.x.
+    paho 1.x: Client(client_id=..., clean_session=...).
+    paho 2.x: первым позиционным аргументом идёт callback_api_version — используем VERSION1,
+    чтобы сигнатуры колбэков (on_connect(client, userdata, flags, rc)) не пришлось менять.
+    Прод-образ аддона на Alpine 3.19 несёт paho 1.6.1; компат нужен на случай иной версии."""
+    try:
+        from paho.mqtt.client import CallbackAPIVersion
+        return mqtt.Client(CallbackAPIVersion.VERSION1, client_id=MQTT_CLIENT_ID, clean_session=True)
+    except (ImportError, AttributeError):
+        return mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
+
+
 class Bridge:
     def __init__(self):
         self.temzit = TemzitClient(TEMZIT_HOST, TEMZIT_PORT, TEMZIT_TIMEOUT)
-        self.client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
+        self.client = make_mqtt_client()
         if MQTT_USER:
             self.client.username_pw_set(MQTT_USER, MQTT_PASS)
         self.client.on_connect = self.on_connect
@@ -367,6 +421,12 @@ class Bridge:
         self._last_good_cfg_raw = None
         self._pending_set = {}
         self._set_lock = threading.Lock()
+        self._last_sync_raw = None
+        self.backup_dir = resolve_writable_dir(TEMZIT_DATA_DIR)
+        if self.backup_dir:
+            print(f'CFG backup dir: {self.backup_dir}', flush=True)
+        else:
+            print('WARNING: нет записываемого каталога для бэкапов — запись будет ЗАБЛОКИРОВАНА', flush=True)
 
     def publish(self, topic, payload, retain=True, qos=0):
         if not isinstance(payload, str):
@@ -441,15 +501,47 @@ class Bridge:
             self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_cfg_error': 'No valid cfg_raw for safe write', 'updates': str(updates)})
             return
 
+        # Применяем обновления к копии и проверяем РЕЗУЛЬТАТ (а не только источник).
+        new_cfg = list(base_cfg)
+        for off, val in updates.items():
+            if not (0 <= off < len(new_cfg)):
+                self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_cfg_error': f'offset out of range: {off}', 'updates': str(updates)})
+                return
+            new_cfg[off] = u8(val)
+
+        # Дедупликация: ничего реально не меняется — НЕ пишем (бережём ресурс flash).
+        if new_cfg == list(base_cfg):
+            self.publish(f'{MQTT_PREFIX}/diag/set_guard', {'status': 'nochange', 'updates': updates, 'base_cfg': base_cfg}, retain=False)
+            print(f'set_cfg skipped (no change): {updates}', flush=True)
+            return
+
+        # Валидация РЕЗУЛЬТАТА: не дать записать нереалистичные параметры (они роняли контроллер).
+        new_ok, new_reason = looks_like_valid_cfg(new_cfg)
+        if not new_ok:
+            self.publish(f'{MQTT_PREFIX}/diag/set_guard', {'status': 'rejected', 'reason': new_reason, 'updates': updates, 'base_cfg': base_cfg, 'new_cfg': new_cfg}, retain=False)
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_cfg_error': f'resulting cfg invalid: {new_reason}', 'updates': str(updates)})
+            print(f'set_cfg REJECTED (invalid result {new_reason}): {updates}', flush=True)
+            return
+
+        # ОБЯЗАТЕЛЬНЫЙ бэкап текущего рабочего дампа ПЕРЕД записью. Нет бэкапа -> нет записи.
+        try:
+            backup_path = self._backup_cfg(base_cfg, reason='pre_write', updates=updates, new_cfg=new_cfg)
+        except Exception as be:
+            self.publish(f'{MQTT_PREFIX}/diag/set_guard', {'status': 'backup_failed', 'error': str(be), 'updates': updates}, retain=False)
+            self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_cfg_error': f'backup failed, write aborted: {be}', 'updates': str(updates)})
+            print(f'set_cfg ABORTED (backup failed: {be}) updates={updates}', flush=True)
+            return
+
         self.publish(f'{MQTT_PREFIX}/diag/set_guard', {
-            'status': 'using', 'chosen': chosen, 'updates': updates, 'base_cfg': base_cfg,
-            'current_ok': current_ok, 'current_reason': current_reason, 'good_ok': good_ok, 'good_reason': good_reason,
+            'status': 'using', 'chosen': chosen, 'updates': updates, 'base_cfg': base_cfg, 'new_cfg': new_cfg,
+            'backup': backup_path, 'current_ok': current_ok, 'good_ok': good_ok,
         }, retain=False)
 
         try:
             result = self.temzit.set_cfg(base_cfg, updates)
+            result['backup'] = backup_path
             self.publish(f'{MQTT_PREFIX}/diag/last_set', result, retain=False)
-            print(f'set_cfg OK: {updates}', flush=True)
+            print(f'set_cfg OK: {updates} (backup={backup_path})', flush=True)
             threading.Timer(2.0, self._force_sync_and_cfg).start()
         except Exception as e:
             print(f'set_cfg ERROR: {e} updates={updates}', flush=True)
@@ -457,6 +549,42 @@ class Bridge:
             with self._set_lock:
                 updates.update(self._pending_set)
                 self._pending_set = updates
+
+    def _backup_cfg(self, cfg_raw, reason, updates=None, new_cfg=None):
+        """Накопительный бэкап рабочего дампа ПЕРЕД записью. Пишет два артефакта:
+          - отдельный файл cfg_<timestamp>.json (уникальное имя -> прежние бэкапы не теряются),
+          - строку в общий журнал temzit_cfg_history.jsonl (append-only, тоже накопление).
+        Возвращает путь к файлу бэкапа. Бросает исключение, если записать не удалось — тогда
+        вызывающий код ОТМЕНЯЕТ запись (нет бэкапа -> нет записи)."""
+        if not self.backup_dir:
+            self.backup_dir = resolve_writable_dir(TEMZIT_DATA_DIR)
+        if not self.backup_dir:
+            raise RuntimeError('нет записываемого каталога для бэкапа')
+        ts = datetime.datetime.now()
+        rec = {
+            'ts': ts.isoformat(timespec='seconds'),
+            'reason': reason,
+            'version': VERSION,
+            'cfg_raw': list(cfg_raw),
+            'cfg_hex': bytes(u8(x) for x in cfg_raw).hex(),
+            'cfg_valid': looks_like_valid_cfg(cfg_raw)[0],
+            'updates': updates,
+            'new_cfg': new_cfg,
+            'sync_raw': self._last_sync_raw,
+        }
+        os.makedirs(self.backup_dir, exist_ok=True)
+        # 1) отдельный файл бэкапа — уникальное имя с микросекундами (не перезаписывает прежние)
+        fname = f'cfg_{ts.strftime("%Y%m%d_%H%M%S_%f")}.json'
+        path = os.path.join(self.backup_dir, fname)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        # 2) накопительный журнал (append-only) — полная история всех бэкапов в одном файле
+        hist = os.path.join(self.backup_dir, 'temzit_cfg_history.jsonl')
+        with open(hist, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        self.publish(f'{MQTT_PREFIX}/diag/backup', {'path': path, 'history': hist, 'ts': rec['ts'], 'reason': reason}, retain=False)
+        print(f'CFG backup written: {path}', flush=True)
+        return path
 
     def _force_cfg_then_flush(self):
         now = time.time()
@@ -552,6 +680,7 @@ class Bridge:
         state['dhw_ha_mode'] = 'heat' if state['ha_mode'] != 'off' else 'off'
         sync_raw = state.get('_sync_raw')
         if sync_raw is not None:
+            self._last_sync_raw = sync_raw
             self.publish(f'{MQTT_PREFIX}/sync/raw', sync_raw, retain=False)
         self.publish(f'{MQTT_PREFIX}/state/json', state)
         for k, v in state.items():
@@ -590,6 +719,16 @@ class Bridge:
             self.publish(f'{MQTT_PREFIX}/bridge/error', {'cfg_error': str(ce)})
 
     def loop(self):
+        # Понятная диагностика вместо тёмной ошибки сокета, если параметры не заполнены.
+        # При host_network=true имя 'core-mosquitto' может не резолвиться — нужен IP брокера.
+        if not MQTT_HOST:
+            print('FATAL: mqtt_host не задан. Укажите IP MQTT-брокера в настройках аддона '
+                  "(при host_network имя 'core-mosquitto' может не резолвиться).", flush=True)
+            raise SystemExit(1)
+        if not TEMZIT_HOST:
+            print('FATAL: temzit_host не задан. Укажите IP гидромодуля ТЭМЗИТ (порт 333).', flush=True)
+            raise SystemExit(1)
+        print(f'Connecting to MQTT {MQTT_HOST}:{MQTT_PORT}, Temzit {TEMZIT_HOST}:{TEMZIT_PORT}', flush=True)
         self.client.will_set(f'{MQTT_PREFIX}/availability', 'offline', retain=True)
         self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.client.loop_start()

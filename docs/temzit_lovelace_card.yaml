@@ -1,0 +1,89 @@
+type: vertical-stack
+cards:
+  - type: markdown
+    content: "## 🔥 Тепловой насос ТЭМЗИТ"
+  - type: horizontal-stack
+    cards:
+      - type: thermostat
+        entity: climate.temzit_climate
+        name: Отопление
+      - type: thermostat
+        entity: climate.temzit_dhw_climate
+        name: ГВС
+  - type: entities
+    title: Состояние
+    show_header_toggle: false
+    entities:
+      - entity: sensor.temzit_mode_name
+        name: Режим
+      - entity: sensor.temzit_compressor_active
+        name: Компрессор
+      - entity: sensor.temzit_compressor_hz_1
+        name: Частота компрессора
+      - entity: sensor.temzit_power_kw
+        name: Потребление
+      - entity: sensor.temzit_flow_l_min
+        name: Проток
+      - entity: sensor.temzit_alarm_text
+        name: Авария
+      - entity: sensor.temzit_active_schedule_name
+        name: Активное расписание
+      - entity: sensor.temzit_fw_version
+        name: Версия ПО
+  - type: glance
+    title: Температуры
+    columns: 4
+    state_color: false
+    entities:
+      - entity: sensor.temzit_t_outdoor
+        name: Улица
+      - entity: sensor.temzit_t_room
+        name: В доме
+      - entity: sensor.temzit_t_supply
+        name: Подача
+      - entity: sensor.temzit_t_return
+        name: Обратка
+      - entity: sensor.temzit_t_dhw
+        name: ГВС
+      - entity: sensor.temzit_t_freon_gas
+        name: Фреон газ
+      - entity: sensor.temzit_t_freon_liquid
+        name: Фреон жидк.
+  - type: entities
+    title: Активное расписание
+    show_header_toggle: false
+    entities:
+      - entity: sensor.temzit_active_schedule_name
+        name: Расписание
+      - entity: sensor.temzit_set_room
+        name: Уставка дома
+      - entity: sensor.temzit_set_water
+        name: Уставка воды
+      - entity: sensor.temzit_set_dhw
+        name: Уставка ГВС
+      - entity: sensor.temzit_set_ten_mode_name
+        name: Режим ТЭНа
+      - entity: sensor.temzit_set_dhw_mode_name
+        name: Режим ГВС
+      - entity: sensor.temzit_set_compressor_limit_name
+        name: Ограничение ККБ
+  - type: entities
+    title: Настройки
+    show_header_toggle: false
+    entities:
+      - entity: sensor.temzit_cfg_room_target
+        name: Уставка дома
+      - entity: sensor.temzit_cfg_water_target
+        name: Уставка воды
+      - entity: sensor.temzit_cfg_dhw_target
+        name: Уставка ГВС
+      - entity: sensor.temzit_cfg_dhw_mode_name
+        name: Режим ГВС
+      - entity: sensor.temzit_cfg_ten_mode_name
+        name: Режим ТЭНа
+      - entity: sensor.temzit_cfg_external_boiler_name
+        name: Внешний котёл
+      - entity: sensor.temzit_cfg_compressor_limit_name
+        name: Ограничение мощности ККБ
+      - entity: sensor.temzit_cfg_weather_comp
+        name: Погодокомпенсация
