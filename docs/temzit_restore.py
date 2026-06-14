@@ -106,10 +106,12 @@ def main():
     if bad:
         raise SystemExit(f'ОТКАЗ: конфиг не прошёл проверку адекватности ({bad}). Запись отменена.')
 
-    # Кадр записи (подтверждён рабочей командой пользователя): 0x35 + config[1..29] + 0xFF + КС.
-    # Режим (offset 0) командой 0x35 НЕ пишется — он управляется с панели ГМ.
-    body = bytes([0x35] + [b & 0xFF for b in raw[1:30]] + [0xFF])
-    frame = body + bytes([sum(body) & 0xFF])
+    # Кадр записи (подтверждён на железе): frame = [0x35, f1, config[0..29]] = 32 байта.
+    # Настройки читаются из frame[2:32]; КС в frame[31]=config[29] = sum(frame[0:31]) & 0xFF;
+    # f1 подбирается так, чтобы КС сошлась: f1 = (config[29] - 0x35 - sum(config[0:29])) & 0xFF.
+    cfg = [b & 0xFF for b in raw]
+    f1 = (cfg[29] - 0x35 - sum(cfg[0:29])) & 0xFF
+    frame = bytes([0x35, f1] + cfg)
 
     print(f'Хост:   {args.host}:{args.port}')
     print(f'Конфиг: {bytes(raw).hex()}')
@@ -128,11 +130,11 @@ def main():
     got = list(resp[2:32])
     print(f'Прочитано: {bytes(got).hex()}')
     print(f'Ожидалось: {bytes(raw).hex()}')
-    # Сверяем только offset 1..29 — Режим (offset 0) командой 0x35 не пишется.
-    diff = [(i, raw[i], got[i]) for i in range(1, 30) if raw[i] != got[i]]
+    # Пишутся все 30 offset (включая Режим offset 0). Read-back может «врать» сразу после записи —
+    # надёжнее свериться по дисплею ГМ.
+    diff = [(i, raw[i], got[i]) for i in range(30) if raw[i] != got[i]]
     if not diff:
-        note = '' if raw[0] == got[0] else f'  (Режим offset0 не менялся: {got[0]}, это норма)'
-        print('РЕЗУЛЬТАТ: СОВПАЛО — настройки восстановлены ✔' + note)
+        print('РЕЗУЛЬТАТ: СОВПАЛО — настройки восстановлены ✔')
     else:
         print('РЕЗУЛЬТАТ: НЕ совпало ✘  расхождения (offset: ожид -> факт):')
         for i, a, b in diff:

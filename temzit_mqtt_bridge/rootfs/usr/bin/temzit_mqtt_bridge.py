@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.6 (WRITE VIA NC)
-Изменения 0.8.6: запись отправляется через `nc` (netcat-openbsd), а НЕ через питон-сокет.
-По захвату Wireshark питон-сокет с верными байтами кадра давал контроллеру сдвиг на 2 байта
-(контроллер даже не отвечал), а `printf | nc` с теми же байтами пишет верно. Поэтому set_cfg
-буквально пайпит кадр в nc (subprocess). Убран прежний кандидат с shutdown(SHUT_WR).
-Запись ОСТАЁТСЯ выключенной по умолчанию (write_enabled=false) — проверять с nc-откатом наготове.
+Temzit MQTT Bridge v0.8.7 (WRITE FRAME SOLVED — confirmed on hardware)
+Кадр записи окончательно разгадан и подтверждён по дисплею ГМ:
+    frame = [0x35, f1, config[0..29]] = 32 байта.
+  - настройки (offset 0..29, ВКЛЮЧАЯ Режим) читаются из frame[2:32];
+  - КС в frame[31] (= config[29]) проверяется как sum(frame[0:31]) & 0xFF;
+  - f1 = (config[29] - 0x35 - sum(config[0:29])) & 0xFF — подгон, чтобы КС сошлась.
+build_setcfg переписан под это; set_mode снова включён (Режим теперь пишется).
+Транспорт — через nc (v0.8.6), это оказалось не критично (дело было в кадре/КС, не в транспорте).
+Запись по-прежнему write_enabled=false по умолчанию — включить и проверить из HA.
 
-Кадр (подтверждён nc, v0.8.4): 0x35 + config[1..29] + 0xFF + КС = 32 байта. Режим (offset 0)
-командой 0x35 не пишется (только панель ГМ); set_mode отклоняется.
+История: сдвиг на байт был из-за того, что настройки клались сразу после 0x35 (а контроллер
+читает с frame[2]); «ничего не пишется» — из-за неверной КС в frame[31].
 
 История kill-switch (0.8.3): запись отключалась, т.к. кадр был неверен (0.8.1 без паддинга —
 сдвиг на 1 байт; 0.8.2 с паддингом — тоже мимо). Теперь кадр верный.
@@ -73,7 +76,7 @@ TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
 # конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
 # случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
 WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
-VERSION = '0.8.6'
+VERSION = '0.8.7'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -210,21 +213,24 @@ def resolve_writable_dir(preferred):
 
 
 # ============================================================================
-# БЛОК ЗАПИСИ — НЕ ИЗМЕНЯТЬ (оставлен идентично v0.7.1)
+# БЛОК ЗАПИСИ
 # ============================================================================
 def build_setcfg(cfg_bytes: list) -> bytes:
+    """Кадр записи 0x35 — ПОДТВЕРЖДЁН на железе по дисплею ГМ (v0.8.7). Ровно 32 байта:
+        frame = [0x35, f1, config[0..29]]
+    Контроллер:
+      - настройки (offset 0..29, включая Режим) читает из frame[2:32];
+      - в frame[31] (это и есть config[29]) ПРОВЕРЯЕТ КС = sum(frame[0:31]) & 0xFF.
+    Байт frame[1] в настройки не идёт — это «настроечный» байт f1, которым мы добиваемся, чтобы
+    КС сошлась с config[29]:
+        f1 = (config[29] - 0x35 - sum(config[0:29])) & 0xFF
+    Прежние версии клали настройки сразу после 0x35 и/или с неверной КС → сдвиг на байт или
+    отказ записи."""
     if len(cfg_bytes) != 30:
         raise ValueError(f'build_setcfg expects 30 cfg bytes, got {len(cfg_bytes)}')
-    # ПОДТВЕРЖДЕНО рабочей командой пользователя (nc), байт-в-байт:
-    #   кадр = 0x35 + <config[1..29]> + 0xFF + КС = 32 байта.
-    # Команда 0x35 пишет параметры НАЧИНАЯ С offset 1 (Тдома); Режим (offset 0) этим кадром
-    # НЕ пишется (управляется с панели/иначе). Полезная нагрузка — 30 байт: настройки offset
-    # 1..29 (29 байт) + один резервный байт 0xFF (offset 30). КС — 1 байт, сумма всех байт
-    # включая cmd. Прежние версии включали offset 0 в начало → всё уезжало на байт.
-    payload = [u8(x) for x in cfg_bytes[1:30]] + [0xFF]
-    frame = bytes([CMD_SETCFG] + payload)
-    crc = sum(frame) & 0xFF
-    return frame + bytes([crc])
+    cfg = [u8(x) for x in cfg_bytes]
+    f1 = (cfg[29] - CMD_SETCFG - sum(cfg[0:29])) & 0xFF
+    return bytes([CMD_SETCFG, f1] + cfg)
 
 
 def looks_like_valid_cfg(cfg_raw):
@@ -491,10 +497,11 @@ class Bridge:
     def _handle_cmd(self, topic, payload):
         suffix = topic.split('/')[-1]
         if suffix == 'set_mode':
-            # Режим (offset 0) командой 0x35 НЕ пишется (подтверждено форматом кадра) — он
-            # управляется с панели ГМ. Не делаем бесполезную запись, сообщаем причину.
-            self.publish(f'{MQTT_PREFIX}/bridge/error', {'set_mode_unsupported': 'Режим (offset 0) не пишется командой 0x35 — переключай его на панели гидромодуля.', 'payload': payload})
-            print(f'set_mode не поддержан протоколом записи: {payload}', flush=True)
+            # Режим (offset 0) кадром 0x35 ПИШЕТСЯ (он во frame[2], подтверждено на железе).
+            p1 = HA_MODE_TO_P1.get(payload.lower())
+            if p1 is None:
+                raise ValueError(f'Unknown mode: {payload}')
+            self._queue_set(CFG_OFFSET_MODE, p1)
         elif suffix == 'set_temperature':
             self._queue_set(CFG_OFFSET_ROOM_TARGET, max(16, min(30, round(float(payload)))))
         elif suffix == 'set_water_temp':
