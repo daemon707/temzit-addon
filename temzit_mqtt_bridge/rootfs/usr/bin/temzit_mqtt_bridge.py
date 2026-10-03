@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.8.7 (WRITE FRAME SOLVED — confirmed on hardware)
+Temzit MQTT Bridge v0.10.0 (CLOUD WRITE)
+Изменения 0.10.0: запись через облако (cloud_write_enabled, по умолчанию выключено). Гистерезисы
+отопления/ГВС, макс. ГВС от ТН, дезинфекция, разморозка в БКН и все поля 4 строк расписания
+меняются из HA сущностями number/switch/select. Запись = POST всей формы (cmd=3/cmd=5) как в
+официальном приложении; меняются только разрешённые поля, значения — только из вариантов формы;
+перед отправкой — обязательный бэкап формы; изменения за 3 с объединяются в одну отправку.
+
+Изменения 0.9.0: необязательный облачный модуль ТОЛЬКО ДЛЯ ЧТЕНИЯ (temzit_cloud.py). Если заданы
+cloud_login/cloud_serial/cloud_password, аддон раз в cloud_interval секунд забирает с
+service.temzit.ru настройки (cmd=2) и расписание (cmd=4) и публикует их сенсорами HA:
+гистерезисы, режим ТА, параметры ККБ2, гликоль и т.д. + 4 строки расписания. Записи в облако НЕТ.
+
+Изменения 0.8.7 (кадр записи разгадан и подтверждён на железе):
 Кадр записи окончательно разгадан и подтверждён по дисплею ГМ:
     frame = [0x35, f1, config[0..29]] = 32 байта.
   - настройки (offset 0..29, ВКЛЮЧАЯ Режим) читаются из frame[2:32];
@@ -52,6 +64,7 @@ build_setcfg переписан под это; set_mode снова включё�
 """
 import os, time, json, socket, threading, datetime, subprocess
 import paho.mqtt.client as mqtt
+import temzit_cloud
 
 TEMZIT_HOST = os.getenv('TEMZIT_HOST', '192.168.2.20')
 TEMZIT_PORT = int(os.getenv('TEMZIT_PORT', '333'))
@@ -76,7 +89,38 @@ TEMZIT_DATA_DIR = os.getenv('TEMZIT_DATA_DIR', '/share/temzit')
 # конфиг по-разному, см. 0.8.2/0.8.3). До выяснения запись ВЫКЛЮЧЕНА по умолчанию — чтобы
 # случайная команда из HA не испортила настройки контроллера. Чтение работает всегда.
 WRITE_ENABLED = os.getenv('TEMZIT_WRITE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
-VERSION = '0.8.7'
+# Облачный модуль. Пусто = выключен. Интервал не чаще раза в 5 минут.
+CLOUD_LOGIN = os.getenv('TEMZIT_CLOUD_LOGIN', '').strip()
+CLOUD_SERIAL = os.getenv('TEMZIT_CLOUD_SERIAL', '').strip()
+CLOUD_PASS = os.getenv('TEMZIT_CLOUD_PASS', '')
+CLOUD_INTERVAL = max(300, int(os.getenv('TEMZIT_CLOUD_INTERVAL', '1800') or 1800))
+CLOUD_ENABLED = bool(CLOUD_LOGIN and CLOUD_SERIAL and CLOUD_PASS)
+# Запись через облако — отдельный выключатель (по умолчанию выключено) и только при включённом модуле.
+CLOUD_WRITE = CLOUD_ENABLED and os.getenv('TEMZIT_CLOUD_WRITE', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+CLOUD_WRITE_DEBOUNCE = 3.0      # с: изменения за это время уходят одной отправкой формы
+CLOUD_RECHECK_AFTER = 150       # с: повторное чтение после записи (ГМ забирает изменения раз в ~1 мин)
+CLOUD_WRITE_NUMBERS = (('P15', 'Темзит Гистерезис отопления (облако)'),
+                       ('P16', 'Темзит Гистерезис ГВС (облако)'),
+                       ('P10', 'Темзит Макс. ГВС от ТН (облако)'))
+CLOUD_WRITE_SWITCHES = (('P11b0', 'Темзит Дезинфекция ГВС (облако)'),
+                        ('P11b2', 'Темзит Разморозка в БКН (облако)'))
+CLOUD_SCHEDULE_LABELS = (('mode', 'режим'), ('start', 'начало'), ('end', 'конец'), ('room', 'Тдома'),
+                         ('water', 'Тводы'), ('dhw_target', 'Тгвс'), ('compressor_limit', 'лимит ККБ'),
+                         ('heater', 'ТЭН'), ('dhw_mode', 'ГВС'))
+# Сенсоры настроек из облака: (поле формы, имя, единицы). С единицами публикуется число, без — подпись.
+CLOUD_SENSORS = [
+    ('P15', 'Темзит Гистерезис отопления', '°C'), ('P16', 'Темзит Гистерезис ГВС', '°C'),
+    ('P10', 'Темзит Макс. ГВС от ТН', '°C'), ('TAmode', 'Темзит Режим ТА', None),
+    ('P11b0', 'Темзит Дезинфекция ГВС', None), ('P11b2', 'Темзит Разморозка в БКН', None),
+    ('HardVersion2b1', 'Темзит Учитывать Тул', None), ('HardVersion2b6', 'Темзит Гликоль', None),
+    ('GVSDualMode', 'Темзит Выбор ККБ для ГВС', None), ('KKB1Type', 'Темзит Тип ККБ1', None),
+    ('KKB2Type', 'Темзит Тип ККБ2', None), ('KKBDualLim', 'Темзит Порог включения ККБ2', None),
+    ('P91', 'Темзит Датчик протока', None), ('P71', 'Темзит WiFi термометр', None),
+    ('P72', 'Темзит Период связи с сервером', 'min'), ('P60', 'Темзит СК режим', None),
+    ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
+    ('P64', 'Темзит СК перегрев БКН', '°C'),
+]
+VERSION = '0.10.0'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -465,6 +509,13 @@ class Bridge:
         self._pending_set = {}
         self._set_lock = threading.Lock()
         self._last_sync_raw = None
+        # Облако: _cloud_io сериализует сетевые обращения (опрос и запись), _cloud_lock — очередь записи.
+        self._cloud_io = threading.Lock()
+        self._cloud_lock = threading.Lock()
+        self._cloud_pending = {}
+        self._cloud_timer = None
+        self._cloud_sched_options = {}
+        self._cloud_write_discovered = False
         self.backup_dir = resolve_writable_dir(TEMZIT_DATA_DIR)
         if self.backup_dir:
             print(f'CFG backup dir: {self.backup_dir}', flush=True)
@@ -485,12 +536,17 @@ class Bridge:
         client.subscribe(f'{MQTT_PREFIX}/climate/set_compressor_limit')
         client.subscribe(f'{MQTT_PREFIX}/cmd/set_byte')
         client.subscribe(f'{MQTT_PREFIX}/cmd/restore_raw')
+        if CLOUD_WRITE:
+            client.subscribe(f'{MQTT_PREFIX}/cloud/set/#')
 
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode('utf-8', errors='ignore').strip()
         try:
-            self._handle_cmd(topic, payload)
+            if topic.startswith(f'{MQTT_PREFIX}/cloud/set/'):
+                self._handle_cloud_cmd(topic, payload)
+            else:
+                self._handle_cmd(topic, payload)
         except Exception as e:
             self.publish(f'{MQTT_PREFIX}/bridge/error', {'cmd_error': str(e), 'topic': topic, 'payload': payload})
 
@@ -759,6 +815,182 @@ class Bridge:
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{key}/config', cfg)
         self.discovery_sent = True
 
+    def publish_cloud_discovery(self):
+        device = {'identifiers': ['temzit_hp_1']}
+        base = f'{MQTT_PREFIX}/cloud'
+        for field, name, unit in CLOUD_SENSORS:
+            key = f'temzit_cloud_{field.lower()}'
+            cfg = {'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'stat_t': f'{base}/cfg/{field}'}
+            if unit:
+                cfg['unit_of_meas'] = unit
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/{key}/config', cfg)
+        for n in range(1, 5):
+            key = f'temzit_cloud_schedule_{n}'
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/{key}/config', {
+                'name': f'Темзит Расписание {n}', 'uniq_id': key, 'obj_id': key, 'device': device,
+                'stat_t': f'{base}/schedule/{n}', 'json_attr_t': f'{base}/schedule/{n}/attr'})
+        self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_cloud_status/config', {
+            'name': 'Темзит Облако', 'uniq_id': 'temzit_cloud_status', 'obj_id': 'temzit_cloud_status',
+            'device': device, 'stat_t': f'{base}/status', 'json_attr_t': f'{base}/status/attr'})
+
+    def publish_cloud_write_discovery(self, fields, rows):
+        """Управляемые сущности для записи через облако (категория «Настройки» на странице устройства).
+        Публикуются после первого чтения: диапазоны и варианты берутся прямо из формы сервера."""
+        device = {'identifiers': ['temzit_hp_1']}
+        base = f'{MQTT_PREFIX}/cloud'
+        for field, name in CLOUD_WRITE_NUMBERS:
+            nums = sorted(int(v) for v in fields[field]['options'])
+            key = f'temzit_cloud_set_{field.lower()}'
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/number/{key}/config', {
+                'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
+                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
+                'min': nums[0], 'max': nums[-1], 'step': 1, 'mode': 'box', 'unit_of_meas': '°C'})
+        for field, name in CLOUD_WRITE_SWITCHES:
+            key = f'temzit_cloud_set_{field.lower()}'
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/switch/{key}/config', {
+                'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
+                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
+                'pl_on': '1', 'pl_off': '0', 'stat_on': 'Да', 'stat_off': 'Нет'})
+        for r in rows:
+            n = r['row']
+            for k, label in CLOUD_SCHEDULE_LABELS:
+                opts = list(r['options'][k].values())
+                if len(set(opts)) != len(opts):
+                    print(f'Cloud: у поля расписания {n}/{k} неуникальные подписи — сущность не создана', flush=True)
+                    continue
+                key = f'temzit_cloud_sched{n}_{k}'
+                self.publish(f'{MQTT_DISCOVERY_PREFIX}/select/{key}/config', {
+                    'name': f'Темзит Расписание {n}: {label}', 'uniq_id': key, 'obj_id': key, 'device': device,
+                    'ent_cat': 'config', 'stat_t': f'{base}/schedule/{n}/{k}',
+                    'cmd_t': f'{base}/set/schedule/{n}/{k}', 'options': opts})
+
+    def _cloud_poll(self):
+        base = f'{MQTT_PREFIX}/cloud'
+        fields = temzit_cloud.get_config(CLOUD_LOGIN, CLOUD_SERIAL, CLOUD_PASS)
+        rows = temzit_cloud.get_schedule(CLOUD_LOGIN, CLOUD_SERIAL, CLOUD_PASS)
+        units = {f: u for f, _, u in CLOUD_SENSORS}
+        for name, f in fields.items():
+            self.publish(f'{base}/cfg/{name}', f['value'] if units.get(name) else temzit_cloud.label_of(f))
+        self.publish(f'{base}/cfg/json', {n: {'value': f['value'], 'label': temzit_cloud.label_of(f)} for n, f in fields.items()})
+        for r in rows:
+            n = r['row']
+            self.publish(f'{base}/schedule/{n}', r['summary'])
+            self.publish(f'{base}/schedule/{n}/attr', {**r['labels'], 'raw': r['raw']})
+            for k, _ in CLOUD_SCHEDULE_LABELS:
+                self.publish(f'{base}/schedule/{n}/{k}', r['labels'][k])
+                self._cloud_sched_options[(n, k)] = r['options'][k]
+        if CLOUD_WRITE and not self._cloud_write_discovered:
+            self.publish_cloud_write_discovery(fields, rows)
+            self._cloud_write_discovered = True
+        return len(fields), len(rows)
+
+    def _cloud_refresh(self):
+        """Опрос облака с публикацией статуса; сетевые обращения сериализованы с записью."""
+        base = f'{MQTT_PREFIX}/cloud'
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        with self._cloud_io:
+            try:
+                nf, nr = self._cloud_poll()
+                self.publish(f'{base}/status', 'ok')
+                self.publish(f'{base}/status/attr', {'updated': now, 'fields': nf, 'schedule_rows': nr,
+                                                     'interval_s': CLOUD_INTERVAL, 'write_enabled': CLOUD_WRITE})
+                print(f'Cloud: OK ({nf} полей настроек, {nr} строки расписания)', flush=True)
+            except Exception as e:
+                # temzit_cloud не включает URL/пароль в тексты ошибок
+                self.publish(f'{base}/status', 'error')
+                self.publish(f'{base}/status/attr', {'error': str(e), 'failed_at': now, 'interval_s': CLOUD_INTERVAL,
+                                                     'write_enabled': CLOUD_WRITE})
+                print(f'Cloud ERROR: {e}', flush=True)
+
+    def _cloud_loop(self):
+        while True:
+            self._cloud_refresh()
+            time.sleep(CLOUD_INTERVAL)
+
+    def _handle_cloud_cmd(self, topic, payload):
+        if not CLOUD_WRITE:
+            raise ValueError('запись через облако выключена (cloud_write_enabled=false)')
+        parts = topic[len(f'{MQTT_PREFIX}/cloud/set/'):].split('/')
+        if parts[0] == 'cfg' and len(parts) == 2:
+            field = parts[1]
+            if field not in temzit_cloud.WRITABLE_CFG:
+                raise ValueError(f'поле {field} нельзя менять из HA')
+            if field in dict(CLOUD_WRITE_NUMBERS):
+                value = str(int(round(float(payload))))
+            else:
+                value = '1' if payload.lower() in ('1', 'on', 'true', 'да') else '0'
+            self._cloud_queue('cfg', field, value)
+        elif parts[0] == 'schedule' and len(parts) == 3:
+            row, key = int(parts[1]), parts[2]
+            opts = self._cloud_sched_options.get((row, key))
+            if not opts:
+                raise ValueError('расписание ещё не прочитано из облака')
+            by_label = {lbl: v for v, lbl in opts.items()}
+            value = by_label.get(payload, payload if payload in opts else None)
+            if value is None:
+                raise ValueError(f'недопустимое значение {payload!r} для расписания {row}/{key}')
+            self._cloud_queue(row, key, value)
+        else:
+            raise ValueError(f'неизвестная команда облака: {topic}')
+
+    def _cloud_queue(self, target, key, value):
+        """Копим изменения CLOUD_WRITE_DEBOUNCE секунд, чтобы движение ползунка дало одну запись."""
+        with self._cloud_lock:
+            self._cloud_pending.setdefault(target, {})[key] = value
+            if self._cloud_timer:
+                self._cloud_timer.cancel()
+            self._cloud_timer = threading.Timer(CLOUD_WRITE_DEBOUNCE, self._cloud_flush)
+            self._cloud_timer.daemon = True
+            self._cloud_timer.start()
+
+    def _cloud_backup(self, target, before, changes):
+        """Бэкап полной формы перед отправкой в облако. Нет бэкапа -> нет записи."""
+        if not self.backup_dir:
+            self.backup_dir = resolve_writable_dir(TEMZIT_DATA_DIR)
+        if not self.backup_dir:
+            raise RuntimeError('нет записываемого каталога для бэкапа')
+        ts = datetime.datetime.now()
+        what = 'cfg' if target == 'cfg' else f'schedule{target}'
+        rec = {'ts': ts.isoformat(timespec='seconds'), 'reason': f'pre_cloud_write_{what}', 'version': VERSION,
+               'target': what, 'changes': changes, 'form': before}
+        path = os.path.join(self.backup_dir, f'cloud_{what}_{ts.strftime("%Y%m%d_%H%M%S_%f")}.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(rec, f, ensure_ascii=False, indent=2)
+        with open(os.path.join(self.backup_dir, 'temzit_cloud_history.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        print(f'Cloud backup written: {path}', flush=True)
+        return path
+
+    def _cloud_flush(self):
+        with self._cloud_lock:
+            pending, self._cloud_pending, self._cloud_timer = self._cloud_pending, {}, None
+        base = f'{MQTT_PREFIX}/cloud'
+        written = False
+        with self._cloud_io:
+            for target, changes in pending.items():
+                now = datetime.datetime.now().isoformat(timespec='seconds')
+                what = 'настройки' if target == 'cfg' else f'расписание {target}'
+                backup = lambda before, t=target, c=changes: self._cloud_backup(t, before, c)
+                try:
+                    if target == 'cfg':
+                        applied, status = temzit_cloud.set_config(changes, CLOUD_LOGIN, CLOUD_SERIAL, CLOUD_PASS, before_post=backup)
+                    else:
+                        applied, status = temzit_cloud.set_schedule(target, changes, CLOUD_LOGIN, CLOUD_SERIAL, CLOUD_PASS, before_post=backup)
+                    written = written or bool(applied)
+                    print(f'Cloud write ({what}): {applied or changes} -> {status}', flush=True)
+                    self.publish(f'{base}/write/last', {'ts': now, 'target': str(target), 'requested': changes,
+                                                        'applied': applied, 'status': status}, retain=False)
+                except Exception as e:
+                    print(f'Cloud write ERROR ({what}): {e}', flush=True)
+                    self.publish(f'{base}/write/last', {'ts': now, 'target': str(target), 'requested': changes,
+                                                        'status': 'error', 'error': str(e)}, retain=False)
+                    self.publish(f'{MQTT_PREFIX}/bridge/error', {'cloud_write_error': str(e), 'target': str(target)}, retain=False)
+        self._cloud_refresh()
+        if written:
+            t = threading.Timer(CLOUD_RECHECK_AFTER, self._cloud_refresh)
+            t.daemon = True
+            t.start()
+
     def _publish_state(self, state: dict):
         mode_code = state.get('mode_code')
         state['ha_mode'] = MODE_CODE_TO_HA.get(mode_code, 'off')
@@ -822,6 +1054,13 @@ class Bridge:
         self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         self.client.loop_start()
         self.publish_discovery()
+        if CLOUD_ENABLED:
+            print(f'Cloud: включён ({"чтение и запись" if CLOUD_WRITE else "только чтение"}), логин {CLOUD_LOGIN}, '
+                  f'опрос раз в {CLOUD_INTERVAL}с', flush=True)
+            self.publish_cloud_discovery()
+            threading.Thread(target=self._cloud_loop, daemon=True).start()
+        else:
+            print('Cloud: выключен (cloud_login/cloud_serial/cloud_password не заданы)', flush=True)
         while True:
             try:
                 state = self.temzit.get_sync()
