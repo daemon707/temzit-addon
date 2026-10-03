@@ -3,6 +3,21 @@
 Все заметные изменения аддона **Temzit MQTT Bridge**.
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/).
 
+## [0.11.0] — 2026-10-03
+
+**Карточка «всё в одном» и сущности управления для неё.**
+
+### Добавлено
+- Сущности локального управления (порт 333, работают при `write_enabled: true`):
+  `select.temzit_ctl_mode` (все режимы P1), `number.temzit_ctl_room_target` (16 = «нет»),
+  `number.temzit_ctl_water_target`, `number.temzit_ctl_dhw_target`,
+  `number.temzit_ctl_weather_comp` (0–1, шаг 0.1), `select.temzit_ctl_compressor_limit`.
+  Поля-числа в режиме «box»: значение уходит по Enter, без серии записей от ползунка.
+- MQTT-команды `cmd/set_mode_name`, `cmd/set_compressor_limit_name`, `cmd/set_weather_comp`.
+- `docs/temzit_lovelace_card.yaml` переписан: статус и аварии, температуры, управление, ГВС и
+  гистерезисы (облако), 4 строки расписания (облако), состояние, график за сутки. Только
+  штатные карточки HA.
+
 ## [0.10.0] — 2026-10-03
 
 **Запись через облако (необязательная, по умолчанию выключена).**

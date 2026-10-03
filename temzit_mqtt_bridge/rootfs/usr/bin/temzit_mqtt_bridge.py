@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.10.0 (CLOUD WRITE)
+Temzit MQTT Bridge v0.11.0 (CONTROL ENTITIES)
+Изменения 0.11.0: сущности локального управления для карточки HA — select «Режим работы»
+(полный список P1), number Тдома/Тводы/Тгвс/погодокомпенсация, select «Лимит ККБ». Пишут через
+проверенный путь записи (порт 333) и работают только при write_enabled=true.
+
 Изменения 0.10.0: запись через облако (cloud_write_enabled, по умолчанию выключено). Гистерезисы
 отопления/ГВС, макс. ГВС от ТН, дезинфекция, разморозка в БКН и все поля 4 строк расписания
 меняются из HA сущностями number/switch/select. Запись = POST всей формы (cmd=3/cmd=5) как в
@@ -120,7 +124,7 @@ CLOUD_SENSORS = [
     ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
     ('P64', 'Темзит СК перегрев БКН', '°C'),
 ]
-VERSION = '0.10.0'
+VERSION = '0.11.0'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -536,6 +540,9 @@ class Bridge:
         client.subscribe(f'{MQTT_PREFIX}/climate/set_compressor_limit')
         client.subscribe(f'{MQTT_PREFIX}/cmd/set_byte')
         client.subscribe(f'{MQTT_PREFIX}/cmd/restore_raw')
+        client.subscribe(f'{MQTT_PREFIX}/cmd/set_mode_name')
+        client.subscribe(f'{MQTT_PREFIX}/cmd/set_compressor_limit_name')
+        client.subscribe(f'{MQTT_PREFIX}/cmd/set_weather_comp')
         if CLOUD_WRITE:
             client.subscribe(f'{MQTT_PREFIX}/cloud/set/#')
 
@@ -566,6 +573,20 @@ class Bridge:
             self._queue_set(CFG_OFFSET_DHW_TARGET, max(20, min(70, round(float(payload)))))
         elif suffix == 'set_compressor_limit':
             self._queue_set(CFG_OFFSET_COMP_LIMIT, max(0, min(10, round(float(payload)))))
+        elif suffix == 'set_mode_name':
+            # Полный список режимов P1 (селектор на карточке): подпись -> код.
+            code = {v: k for k, v in P1_NAMES.items()}.get(payload)
+            if code is None:
+                raise ValueError(f'Unknown mode name: {payload}')
+            self._queue_set(CFG_OFFSET_MODE, code)
+        elif suffix == 'set_compressor_limit_name':
+            code = {v: k for k, v in COMP_LIMIT_NAMES.items()}.get(payload)
+            if code is None:
+                raise ValueError(f'Unknown compressor limit: {payload}')
+            self._queue_set(CFG_OFFSET_COMP_LIMIT, code)
+        elif suffix == 'set_weather_comp':
+            # Погодокомпенсация 0.0..1.0 -> байт 0..10 (как в форме сервера).
+            self._queue_set(CFG_OFFSET_WEATHER_COMP, max(0, min(10, round(float(payload) * 10))))
         elif suffix == 'set_byte':
             data = json.loads(payload)
             self._queue_set(int(data['offset']), int(data['value']))
@@ -813,6 +834,31 @@ class Bridge:
             if dev_cla:
                 cfg['dev_cla'] = dev_cla
             self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_{key}/config', cfg)
+
+        # Локальное управление ядром (порт 333) для карточки. Работает только при write_enabled=true;
+        # иначе команда отклоняется с уведомлением в temzit/bridge/error. mode=box — значение уходит
+        # по Enter, а не на каждое движение ползунка.
+        st, cmd = f'{MQTT_PREFIX}/state', f'{MQTT_PREFIX}'
+        controls = [
+            ('select', 'ctl_mode', 'Темзит Режим работы', {'stat_t': f'{st}/cfg_mode_name', 'cmd_t': f'{cmd}/cmd/set_mode_name',
+                                                           'options': list(P1_NAMES.values())}),
+            ('number', 'ctl_room_target', 'Темзит Тдома (16 = нет)', {'stat_t': f'{st}/cfg_room_target', 'cmd_t': f'{cmd}/climate/set_temperature',
+                                                                     'min': 16, 'max': 30, 'step': 1, 'unit_of_meas': '°C'}),
+            ('number', 'ctl_water_target', 'Темзит Тводы', {'stat_t': f'{st}/cfg_water_target', 'cmd_t': f'{cmd}/climate/set_water_temp',
+                                                            'min': 5, 'max': 55, 'step': 1, 'unit_of_meas': '°C'}),
+            ('number', 'ctl_dhw_target', 'Темзит Тгвс', {'stat_t': f'{st}/cfg_dhw_target', 'cmd_t': f'{cmd}/climate/set_dhw_temp',
+                                                         'min': 20, 'max': 70, 'step': 1, 'unit_of_meas': '°C'}),
+            ('select', 'ctl_compressor_limit', 'Темзит Лимит ККБ', {'stat_t': f'{st}/cfg_compressor_limit_name',
+                                                                    'cmd_t': f'{cmd}/cmd/set_compressor_limit_name',
+                                                                    'options': list(COMP_LIMIT_NAMES.values())}),
+            ('number', 'ctl_weather_comp', 'Темзит Погодокомпенсация', {'stat_t': f'{st}/cfg_weather_comp', 'cmd_t': f'{cmd}/cmd/set_weather_comp',
+                                                                        'min': 0, 'max': 1, 'step': 0.1}),
+        ]
+        for platform, key, name, extra in controls:
+            cfg = {'name': name, 'uniq_id': f'temzit_{key}', 'obj_id': f'temzit_{key}', 'device': device, **avail, **extra}
+            if platform == 'number':
+                cfg['mode'] = 'box'
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/{platform}/temzit_{key}/config', cfg)
         self.discovery_sent = True
 
     def publish_cloud_discovery(self):

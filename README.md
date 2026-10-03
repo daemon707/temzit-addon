@@ -6,7 +6,7 @@
 `service.temzit.ru`.
 
 Репозиторий: <https://github.com/daemon707/temzit-addon>
-Текущая версия аддона: **0.10.0**
+Текущая версия аддона: **0.11.0**
 
 > **Облачный модуль (необязательный).** Если указать `cloud_login`, `cloud_serial` и
 > `cloud_password`, аддон раз в `cloud_interval` секунд забирает с `service.temzit.ru` параметры,
