@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.11.1 (HA 2026.4+ ENTITY IDS)
+Temzit MQTT Bridge v0.11.2 (ENTITY ID MIGRATION)
+Изменения 0.11.2: сущности ctl_* и cloud_* публикуются под unique_id ревизии _v2, а их старые
+discovery-записи стираются. Так сущности, созданные HA 2026.4+ с id из русских названий,
+удаляются и создаются заново с правильными entity_id — вручную ничего переименовывать не нужно.
+
+Изменения 0.11.1 (HA 2026.4+ ENTITY IDS):
 Изменения 0.11.1: в discovery вместо obj_id публикуется default_entity_id ("<домен>.temzit_...").
 HA 2026.4+ больше не учитывает obj_id, и новые сущности получали id из русских названий.
 
@@ -128,7 +133,7 @@ CLOUD_SENSORS = [
     ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
     ('P64', 'Темзит СК перегрев БКН', '°C'),
 ]
-VERSION = '0.11.1'
+VERSION = '0.11.2'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -540,6 +545,27 @@ class Bridge:
             payload = json.dumps(payload, ensure_ascii=False)
         self.client.publish(topic, payload, qos=qos, retain=retain)
 
+    def _discover(self, platform, key, cfg):
+        """Discovery новых сущностей (ctl_*, cloud_*) под ревизией _v2.
+        До 0.11.2 в HA 2026.4+ они создавались с entity_id из русских названий (obj_id игнорируется).
+        Пустое retained-сообщение в старый топик удаляет такую сущность из HA, а публикация под новым
+        unique_id создаёт её заново с entity_id из default_entity_id ('<домен>.<key>').
+        Публикация отложена до _flush_discovery(): сначала стираем всё, ждём, потом создаём —
+        чтобы HA успел освободить старые id (иначе вручную переименованные получат суффикс _2)."""
+        if not hasattr(self, '_disc_batch'):
+            self._disc_batch = []
+        self._disc_batch.append((platform, key, dict(cfg, uniq_id=f'{key}_v2', obj_id=key)))
+
+    def _flush_discovery(self, pause=3.0):
+        batch, self._disc_batch = getattr(self, '_disc_batch', []), []
+        if not batch:
+            return
+        for platform, key, _ in batch:
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/{platform}/{key}/config', '')
+        time.sleep(pause)
+        for platform, key, cfg in batch:
+            self.publish(f'{MQTT_DISCOVERY_PREFIX}/{platform}/{key}_v2/config', cfg)
+
     def on_connect(self, client, userdata, flags, rc):
         self.publish(f'{MQTT_PREFIX}/availability', 'online')
         client.subscribe(f'{MQTT_PREFIX}/climate/set_mode')
@@ -867,7 +893,8 @@ class Bridge:
             cfg = {'name': name, 'uniq_id': f'temzit_{key}', 'obj_id': f'temzit_{key}', 'device': device, **avail, **extra}
             if platform == 'number':
                 cfg['mode'] = 'box'
-            self.publish(f'{MQTT_DISCOVERY_PREFIX}/{platform}/temzit_{key}/config', cfg)
+            self._discover(platform, f'temzit_{key}', cfg)
+        self._flush_discovery()
         self.discovery_sent = True
 
     def publish_cloud_discovery(self):
@@ -878,15 +905,16 @@ class Bridge:
             cfg = {'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'stat_t': f'{base}/cfg/{field}'}
             if unit:
                 cfg['unit_of_meas'] = unit
-            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/{key}/config', cfg)
+            self._discover('sensor', key, cfg)
         for n in range(1, 5):
             key = f'temzit_cloud_schedule_{n}'
-            self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/{key}/config', {
+            self._discover('sensor', key, {
                 'name': f'Темзит Расписание {n}', 'uniq_id': key, 'obj_id': key, 'device': device,
                 'stat_t': f'{base}/schedule/{n}', 'json_attr_t': f'{base}/schedule/{n}/attr'})
-        self.publish(f'{MQTT_DISCOVERY_PREFIX}/sensor/temzit_cloud_status/config', {
+        self._discover('sensor', 'temzit_cloud_status', {
             'name': 'Темзит Облако', 'uniq_id': 'temzit_cloud_status', 'obj_id': 'temzit_cloud_status',
             'device': device, 'stat_t': f'{base}/status', 'json_attr_t': f'{base}/status/attr'})
+        self._flush_discovery()
 
     def publish_cloud_write_discovery(self, fields, rows):
         """Управляемые сущности для записи через облако (категория «Настройки» на странице устройства).
@@ -896,13 +924,13 @@ class Bridge:
         for field, name in CLOUD_WRITE_NUMBERS:
             nums = sorted(int(v) for v in fields[field]['options'])
             key = f'temzit_cloud_set_{field.lower()}'
-            self.publish(f'{MQTT_DISCOVERY_PREFIX}/number/{key}/config', {
+            self._discover('number', key, {
                 'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
                 'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
                 'min': nums[0], 'max': nums[-1], 'step': 1, 'mode': 'box', 'unit_of_meas': '°C'})
         for field, name in CLOUD_WRITE_SWITCHES:
             key = f'temzit_cloud_set_{field.lower()}'
-            self.publish(f'{MQTT_DISCOVERY_PREFIX}/switch/{key}/config', {
+            self._discover('switch', key, {
                 'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
                 'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
                 'pl_on': '1', 'pl_off': '0', 'stat_on': 'Да', 'stat_off': 'Нет'})
@@ -914,10 +942,11 @@ class Bridge:
                     print(f'Cloud: у поля расписания {n}/{k} неуникальные подписи — сущность не создана', flush=True)
                     continue
                 key = f'temzit_cloud_sched{n}_{k}'
-                self.publish(f'{MQTT_DISCOVERY_PREFIX}/select/{key}/config', {
+                self._discover('select', key, {
                     'name': f'Темзит Расписание {n}: {label}', 'uniq_id': key, 'obj_id': key, 'device': device,
                     'ent_cat': 'config', 'stat_t': f'{base}/schedule/{n}/{k}',
                     'cmd_t': f'{base}/set/schedule/{n}/{k}', 'options': opts})
+        self._flush_discovery()
 
     def _cloud_poll(self):
         base = f'{MQTT_PREFIX}/cloud'
