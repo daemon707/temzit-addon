@@ -6,7 +6,7 @@
 `service.temzit.ru`.
 
 Репозиторий: <https://github.com/daemon707/temzit-addon>
-Текущая версия аддона: **0.11.2**
+Текущая версия аддона: **0.12.0**
 
 > **Облачный модуль (необязательный).** Если указать `cloud_login`, `cloud_serial` и
 > `cloud_password`, аддон раз в `cloud_interval` секунд забирает с `service.temzit.ru` параметры,
@@ -54,8 +54,11 @@
 - ~29 сенсоров: температуры, проток, мощность, частота компрессора, состояние, авария,
   версия ПО, уставки конфига и активного расписания.
 
-Готовый дашборд — [`docs/temzit_lovelace_card.yaml`](docs/temzit_lovelace_card.yaml)
-(вставить в HA как **Manual card**).
+Карточки для HA (только штатные карточки):
+- [`docs/temzit_lovelace_card.yaml`](docs/temzit_lovelace_card.yaml) — компактная, для главного экрана:
+  режим, температуры, кнопка перехода к управлению;
+- [`docs/temzit_lovelace_settings.yaml`](docs/temzit_lovelace_settings.yaml) — отдельная вкладка со всем
+  управлением и переключателем «Облачный режим» (инструкция в начале файла).
 
 ## Установка
 

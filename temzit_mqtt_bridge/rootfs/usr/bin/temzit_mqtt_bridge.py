@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.11.2 (ENTITY ID MIGRATION)
+Temzit MQTT Bridge v0.12.0 (CLOUD/LOCAL MODE SWITCH)
+Изменения 0.12.0: переключатель switch.temzit_cloud_mode «Облачный режим». Выключен — аддон не
+обращается к облаку, облачные сущности недоступны (availability temzit/cloud/availability),
+облачные команды отклоняются. Выбор хранится в data_dir/cloud_mode.json.
+
+Изменения 0.11.2 (ENTITY ID MIGRATION):
 Изменения 0.11.2: сущности ctl_* и cloud_* публикуются под unique_id ревизии _v2, а их старые
 discovery-записи стираются. Так сущности, созданные HA 2026.4+ с id из русских названий,
 удаляются и создаются заново с правильными entity_id — вручную ничего переименовывать не нужно.
@@ -133,7 +138,7 @@ CLOUD_SENSORS = [
     ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
     ('P64', 'Темзит СК перегрев БКН', '°C'),
 ]
-VERSION = '0.11.2'
+VERSION = '0.12.0'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -534,6 +539,9 @@ class Bridge:
             print(f'CFG backup dir: {self.backup_dir}', flush=True)
         else:
             print('WARNING: нет записываемого каталога для бэкапов — запись будет ЗАБЛОКИРОВАНА', flush=True)
+        # Режим «Облачный/Локальный» (переключатель в HA), запоминается в data_dir/cloud_mode.json.
+        self._cloud_wake = threading.Event()
+        self.cloud_on = self._load_cloud_mode()
 
     def publish(self, topic, payload, retain=True, qos=0):
         # HA 2026.4+ игнорирует obj_id в MQTT discovery: идентификатор сущности задаётся только полем
@@ -580,12 +588,16 @@ class Bridge:
         client.subscribe(f'{MQTT_PREFIX}/cmd/set_weather_comp')
         if CLOUD_WRITE:
             client.subscribe(f'{MQTT_PREFIX}/cloud/set/#')
+        if CLOUD_ENABLED:
+            client.subscribe(f'{MQTT_PREFIX}/cloud/mode/set')
 
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         payload = msg.payload.decode('utf-8', errors='ignore').strip()
         try:
-            if topic.startswith(f'{MQTT_PREFIX}/cloud/set/'):
+            if topic == f'{MQTT_PREFIX}/cloud/mode/set':
+                self._set_cloud_mode(payload)
+            elif topic.startswith(f'{MQTT_PREFIX}/cloud/set/'):
                 self._handle_cloud_cmd(topic, payload)
             else:
                 self._handle_cmd(topic, payload)
@@ -897,12 +909,19 @@ class Bridge:
         self._flush_discovery()
         self.discovery_sent = True
 
+    @staticmethod
+    def _cloud_avty():
+        """Облачные сущности доступны, только если работает аддон И включён облачный режим."""
+        return {'avty': [{'t': f'{MQTT_PREFIX}/availability'}, {'t': f'{MQTT_PREFIX}/cloud/availability'}],
+                'avty_mode': 'all'}
+
     def publish_cloud_discovery(self):
         device = {'identifiers': ['temzit_hp_1']}
         base = f'{MQTT_PREFIX}/cloud'
+        avty = self._cloud_avty()
         for field, name, unit in CLOUD_SENSORS:
             key = f'temzit_cloud_{field.lower()}'
-            cfg = {'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'stat_t': f'{base}/cfg/{field}'}
+            cfg = {'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'stat_t': f'{base}/cfg/{field}', **avty}
             if unit:
                 cfg['unit_of_meas'] = unit
             self._discover('sensor', key, cfg)
@@ -910,29 +929,71 @@ class Bridge:
             key = f'temzit_cloud_schedule_{n}'
             self._discover('sensor', key, {
                 'name': f'Темзит Расписание {n}', 'uniq_id': key, 'obj_id': key, 'device': device,
-                'stat_t': f'{base}/schedule/{n}', 'json_attr_t': f'{base}/schedule/{n}/attr'})
+                'stat_t': f'{base}/schedule/{n}', 'json_attr_t': f'{base}/schedule/{n}/attr', **avty})
         self._discover('sensor', 'temzit_cloud_status', {
             'name': 'Темзит Облако', 'uniq_id': 'temzit_cloud_status', 'obj_id': 'temzit_cloud_status',
             'device': device, 'stat_t': f'{base}/status', 'json_attr_t': f'{base}/status/attr'})
+        self._discover('switch', 'temzit_cloud_mode', {
+            'name': 'Темзит Облачный режим', 'device': device, 'icon': 'mdi:cloud-sync',
+            'stat_t': f'{base}/mode', 'cmd_t': f'{base}/mode/set', 'pl_on': 'ON', 'pl_off': 'OFF',
+            'availability_topic': f'{MQTT_PREFIX}/availability', 'payload_available': 'online',
+            'payload_not_available': 'offline'})
         self._flush_discovery()
+
+    def _load_cloud_mode(self):
+        try:
+            with open(os.path.join(self.backup_dir, 'cloud_mode.json'), encoding='utf-8') as f:
+                return bool(json.load(f).get('cloud_on', True))
+        except Exception:
+            return True
+
+    def _publish_cloud_mode(self):
+        base = f'{MQTT_PREFIX}/cloud'
+        self.publish(f'{base}/mode', 'ON' if self.cloud_on else 'OFF')
+        self.publish(f'{base}/availability', 'online' if self.cloud_on else 'offline')
+        if not self.cloud_on:
+            self.publish(f'{base}/status', 'off')
+            self.publish(f'{base}/status/attr', {'mode': 'local', 'write_enabled': CLOUD_WRITE})
+
+    def _set_cloud_mode(self, payload):
+        on = payload.strip().upper() in ('ON', '1', 'TRUE')
+        changed = on != self.cloud_on
+        self.cloud_on = on
+        if not on:
+            with self._cloud_lock:    # несохранённые облачные изменения отбрасываем
+                if self._cloud_timer:
+                    self._cloud_timer.cancel()
+                self._cloud_pending, self._cloud_timer = {}, None
+        if changed and self.backup_dir:
+            try:
+                with open(os.path.join(self.backup_dir, 'cloud_mode.json'), 'w', encoding='utf-8') as f:
+                    json.dump({'cloud_on': on}, f)
+            except Exception as e:
+                print(f'Cloud mode: не удалось сохранить выбор: {e}', flush=True)
+        self._publish_cloud_mode()
+        if changed:
+            print(f'Cloud mode: {"облачный" if on else "локальный"}', flush=True)
+        if on:
+            self._cloud_wake.set()    # сразу перечитать облако
 
     def publish_cloud_write_discovery(self, fields, rows):
         """Управляемые сущности для записи через облако (категория «Настройки» на странице устройства).
         Публикуются после первого чтения: диапазоны и варианты берутся прямо из формы сервера."""
         device = {'identifiers': ['temzit_hp_1']}
         base = f'{MQTT_PREFIX}/cloud'
+        avty = self._cloud_avty()
         for field, name in CLOUD_WRITE_NUMBERS:
             nums = sorted(int(v) for v in fields[field]['options'])
             key = f'temzit_cloud_set_{field.lower()}'
             self._discover('number', key, {
                 'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
-                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
+                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}', **avty,
                 'min': nums[0], 'max': nums[-1], 'step': 1, 'mode': 'box', 'unit_of_meas': '°C'})
         for field, name in CLOUD_WRITE_SWITCHES:
             key = f'temzit_cloud_set_{field.lower()}'
             self._discover('switch', key, {
                 'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'ent_cat': 'config',
-                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}',
+                'stat_t': f'{base}/cfg/{field}', 'cmd_t': f'{base}/set/cfg/{field}', **avty,
                 'pl_on': '1', 'pl_off': '0', 'stat_on': 'Да', 'stat_off': 'Нет'})
         for r in rows:
             n = r['row']
@@ -945,7 +1006,7 @@ class Bridge:
                 self._discover('select', key, {
                     'name': f'Темзит Расписание {n}: {label}', 'uniq_id': key, 'obj_id': key, 'device': device,
                     'ent_cat': 'config', 'stat_t': f'{base}/schedule/{n}/{k}',
-                    'cmd_t': f'{base}/set/schedule/{n}/{k}', 'options': opts})
+                    'cmd_t': f'{base}/set/schedule/{n}/{k}', 'options': opts, **avty})
         self._flush_discovery()
 
     def _cloud_poll(self):
@@ -970,6 +1031,8 @@ class Bridge:
 
     def _cloud_refresh(self):
         """Опрос облака с публикацией статуса; сетевые обращения сериализованы с записью."""
+        if not self.cloud_on:
+            return
         base = f'{MQTT_PREFIX}/cloud'
         now = datetime.datetime.now().isoformat(timespec='seconds')
         with self._cloud_io:
@@ -988,12 +1051,15 @@ class Bridge:
 
     def _cloud_loop(self):
         while True:
-            self._cloud_refresh()
-            time.sleep(CLOUD_INTERVAL)
+            self._cloud_refresh()          # в локальном режиме сразу выходит
+            self._cloud_wake.wait(CLOUD_INTERVAL)
+            self._cloud_wake.clear()
 
     def _handle_cloud_cmd(self, topic, payload):
         if not CLOUD_WRITE:
             raise ValueError('запись через облако выключена (cloud_write_enabled=false)')
+        if not self.cloud_on:
+            raise ValueError('включён локальный режим — облачные настройки не меняются')
         parts = topic[len(f'{MQTT_PREFIX}/cloud/set/'):].split('/')
         if parts[0] == 'cfg' and len(parts) == 2:
             field = parts[1]
@@ -1048,6 +1114,8 @@ class Bridge:
     def _cloud_flush(self):
         with self._cloud_lock:
             pending, self._cloud_pending, self._cloud_timer = self._cloud_pending, {}, None
+        if not self.cloud_on:
+            return
         base = f'{MQTT_PREFIX}/cloud'
         written = False
         with self._cloud_io:
@@ -1142,6 +1210,8 @@ class Bridge:
             print(f'Cloud: включён ({"чтение и запись" if CLOUD_WRITE else "только чтение"}), логин {CLOUD_LOGIN}, '
                   f'опрос раз в {CLOUD_INTERVAL}с', flush=True)
             self.publish_cloud_discovery()
+            self._publish_cloud_mode()
+            print(f'Cloud mode: {"облачный" if self.cloud_on else "локальный"}', flush=True)
             threading.Thread(target=self._cloud_loop, daemon=True).start()
         else:
             print('Cloud: выключен (cloud_login/cloud_serial/cloud_password не заданы)', flush=True)

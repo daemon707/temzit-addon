@@ -1,17 +1,15 @@
-# Карточка «Тепловой насос ТЭМЗИТ» — всё управление в одном месте.
-# Только штатные карточки HA, ничего устанавливать не нужно.
-# Вставка: Панель → ⋮ → Изменить панель → Добавить карточку → «Вручную» (Manual) → вставить целиком.
+# Компактная карточка ТЭМЗИТ для главного экрана: режим, температуры, кнопка перехода к управлению.
+# Только штатные карточки HA. Вставка: Изменить панель → Добавить карточку → «Вручную» → вставить.
 #
-# Требования: аддон Temzit MQTT Bridge ≥ 0.11.0.
-#   - блок «Управление» работает при write_enabled: true (локальная запись по порту 333);
-#   - блоки «ГВС и гистерезисы» и «Расписание» — при заполненных cloud_* и cloud_write_enabled: true.
-# Значения в полях-числах применяются по Enter (или при уходе из поля), а не на каждое нажатие стрелки.
+# Кнопка «Управление» ведёт на вкладку с путём /lovelace/temzit (см. docs/temzit_lovelace_settings.yaml).
+# Если твоя панель не «Обзор» или у вкладки другой URL — поправь navigation_path внизу.
 type: vertical-stack
 cards:
   - type: markdown
     content: |
       ## 🔥 Тепловой насос ТЭМЗИТ
       **{{ states('sensor.temzit_mode_name') }}** · компрессор {{ states('sensor.temzit_compressor_active') }}
+      · {{ 'облако' if is_state('switch.temzit_cloud_mode', 'on') else 'локально' }}
       {%- if states('sensor.temzit_alarm_text') not in ['ok', 'unknown', 'unavailable'] %}
       ⚠️ **Авария:** {{ states('sensor.temzit_alarm_text') }}
       {%- endif %}
@@ -34,176 +32,14 @@ cards:
         name: Мощность
       - entity: sensor.temzit_compressor_hz_1
         name: Компрессор
-      - entity: sensor.temzit_flow_l_min
-        name: Проток
-
-  - type: entities
-    title: Управление
-    show_header_toggle: false
-    entities:
-      - entity: select.temzit_ctl_mode
-        name: Режим работы
-      - entity: number.temzit_ctl_water_target
-        name: Температура воды
-      - entity: number.temzit_ctl_room_target
-        name: Температура в доме (16 = нет)
-      - entity: number.temzit_ctl_weather_comp
-        name: Погодокомпенсация
-      - entity: select.temzit_ctl_compressor_limit
-        name: Ограничение компрессора
-      - entity: number.temzit_ctl_dhw_target
-        name: Температура ГВС
-      - type: attribute
-        entity: sensor.temzit_cloud_status
-        attribute: updated
-        name: Облако обновлено
-
-  - type: entities
-    title: ГВС и гистерезисы (через облако)
-    show_header_toggle: false
-    entities:
-      - entity: number.temzit_cloud_set_p15
-        name: Гистерезис отопления
-      - entity: number.temzit_cloud_set_p16
-        name: Гистерезис ГВС
-      - entity: number.temzit_cloud_set_p10
-        name: Макс. ГВС от теплового насоса
-      - entity: switch.temzit_cloud_set_p11b0
-        name: Дезинфекция бака
-      - entity: switch.temzit_cloud_set_p11b2
-        name: Разморозка в БКН
-
-  - type: grid
-    columns: 2
-    square: false
-    cards:
-      - type: entities
-        title: Расписание 1
-        show_header_toggle: false
-        entities:
-          - entity: sensor.temzit_cloud_schedule_1
-            name: Сейчас
-          - entity: select.temzit_cloud_sched1_mode
-            name: Режим
-          - entity: select.temzit_cloud_sched1_start
-            name: Начало
-          - entity: select.temzit_cloud_sched1_end
-            name: Конец
-          - entity: select.temzit_cloud_sched1_room
-            name: Тдома
-          - entity: select.temzit_cloud_sched1_water
-            name: Тводы
-          - entity: select.temzit_cloud_sched1_compressor_limit
-            name: Лимит ККБ
-          - entity: select.temzit_cloud_sched1_heater
-            name: ТЭН
-          - entity: select.temzit_cloud_sched1_dhw_mode
-            name: ГВС
-          - entity: select.temzit_cloud_sched1_dhw_target
-            name: Тгвс
-      - type: entities
-        title: Расписание 2
-        show_header_toggle: false
-        entities:
-          - entity: sensor.temzit_cloud_schedule_2
-            name: Сейчас
-          - entity: select.temzit_cloud_sched2_mode
-            name: Режим
-          - entity: select.temzit_cloud_sched2_start
-            name: Начало
-          - entity: select.temzit_cloud_sched2_end
-            name: Конец
-          - entity: select.temzit_cloud_sched2_room
-            name: Тдома
-          - entity: select.temzit_cloud_sched2_water
-            name: Тводы
-          - entity: select.temzit_cloud_sched2_compressor_limit
-            name: Лимит ККБ
-          - entity: select.temzit_cloud_sched2_heater
-            name: ТЭН
-          - entity: select.temzit_cloud_sched2_dhw_mode
-            name: ГВС
-          - entity: select.temzit_cloud_sched2_dhw_target
-            name: Тгвс
-      - type: entities
-        title: Расписание 3
-        show_header_toggle: false
-        entities:
-          - entity: sensor.temzit_cloud_schedule_3
-            name: Сейчас
-          - entity: select.temzit_cloud_sched3_mode
-            name: Режим
-          - entity: select.temzit_cloud_sched3_start
-            name: Начало
-          - entity: select.temzit_cloud_sched3_end
-            name: Конец
-          - entity: select.temzit_cloud_sched3_room
-            name: Тдома
-          - entity: select.temzit_cloud_sched3_water
-            name: Тводы
-          - entity: select.temzit_cloud_sched3_compressor_limit
-            name: Лимит ККБ
-          - entity: select.temzit_cloud_sched3_heater
-            name: ТЭН
-          - entity: select.temzit_cloud_sched3_dhw_mode
-            name: ГВС
-          - entity: select.temzit_cloud_sched3_dhw_target
-            name: Тгвс
-      - type: entities
-        title: Расписание 4
-        show_header_toggle: false
-        entities:
-          - entity: sensor.temzit_cloud_schedule_4
-            name: Сейчас
-          - entity: select.temzit_cloud_sched4_mode
-            name: Режим
-          - entity: select.temzit_cloud_sched4_start
-            name: Начало
-          - entity: select.temzit_cloud_sched4_end
-            name: Конец
-          - entity: select.temzit_cloud_sched4_room
-            name: Тдома
-          - entity: select.temzit_cloud_sched4_water
-            name: Тводы
-          - entity: select.temzit_cloud_sched4_compressor_limit
-            name: Лимит ККБ
-          - entity: select.temzit_cloud_sched4_heater
-            name: ТЭН
-          - entity: select.temzit_cloud_sched4_dhw_mode
-            name: ГВС
-          - entity: select.temzit_cloud_sched4_dhw_target
-            name: Тгвс
-
-  - type: entities
-    title: Состояние
-    show_header_toggle: false
-    entities:
-      - entity: sensor.temzit_active_schedule_name
-        name: Активное расписание
       - entity: sensor.temzit_set_water
-        name: Уставка воды сейчас
-      - entity: sensor.temzit_cfg_ten_mode_name
-        name: Режим ТЭНа
-      - entity: sensor.temzit_cfg_dhw_mode_name
-        name: Режим ГВС
-      - entity: sensor.temzit_t_freon_gas
-        name: Фреон газ
-      - entity: sensor.temzit_t_freon_liquid
-        name: Фреон жидкость
-      - entity: sensor.temzit_cloud_status
-        name: Связь с облаком
-      - entity: sensor.temzit_alarm_text
-        name: Аварии
+        name: Уставка воды
 
-  - type: history-graph
-    title: Температуры за сутки
-    hours_to_show: 24
-    entities:
-      - entity: sensor.temzit_t_outdoor
-        name: Улица
-      - entity: sensor.temzit_t_supply
-        name: Подача
-      - entity: sensor.temzit_t_return
-        name: Обратка
-      - entity: sensor.temzit_t_dhw
-        name: ГВС
+  - type: button
+    name: Управление насосом
+    icon: mdi:tune-variant
+    show_state: false
+    icon_height: 32px
+    tap_action:
+      action: navigate
+      navigation_path: /lovelace/temzit
