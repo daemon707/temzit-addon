@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.11.0 (CONTROL ENTITIES)
+Temzit MQTT Bridge v0.11.1 (HA 2026.4+ ENTITY IDS)
+Изменения 0.11.1: в discovery вместо obj_id публикуется default_entity_id ("<домен>.temzit_...").
+HA 2026.4+ больше не учитывает obj_id, и новые сущности получали id из русских названий.
+
+Изменения 0.11.0 (CONTROL ENTITIES):
 Изменения 0.11.0: сущности локального управления для карточки HA — select «Режим работы»
 (полный список P1), number Тдома/Тводы/Тгвс/погодокомпенсация, select «Лимит ККБ». Пишут через
 проверенный путь записи (порт 333) и работают только при write_enabled=true.
@@ -124,7 +128,7 @@ CLOUD_SENSORS = [
     ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
     ('P64', 'Темзит СК перегрев БКН', '°C'),
 ]
-VERSION = '0.11.0'
+VERSION = '0.11.1'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -527,6 +531,11 @@ class Bridge:
             print('WARNING: нет записываемого каталога для бэкапов — запись будет ЗАБЛОКИРОВАНА', flush=True)
 
     def publish(self, topic, payload, retain=True, qos=0):
+        # HA 2026.4+ игнорирует obj_id в MQTT discovery: идентификатор сущности задаётся только полем
+        # default_entity_id вида '<домен>.<имя>'. Иначе HA строит entity_id из русского названия.
+        if isinstance(payload, dict) and 'obj_id' in payload and topic.startswith(f'{MQTT_DISCOVERY_PREFIX}/'):
+            payload = dict(payload)
+            payload['default_entity_id'] = f"{topic.split('/')[1]}.{payload.pop('obj_id')}"
         if not isinstance(payload, str):
             payload = json.dumps(payload, ensure_ascii=False)
         self.client.publish(topic, payload, qos=qos, retain=retain)
