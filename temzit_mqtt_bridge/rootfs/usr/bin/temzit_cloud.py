@@ -248,3 +248,122 @@ def get_schedule(login, serial, password, timeout=20, fields=None) -> list:
         summary = labels['mode'] if raw['mode'] == '0' else f"{labels['mode']} {labels['start']}–{labels['end']}"
         rows.append({'row': n, 'summary': summary, 'raw': raw, 'labels': labels, 'options': options})
     return rows
+
+
+# ---------------------------------------------------------------------------------------------
+# Статистика (графики) — /stats/getdata под сессией сайта (API cmd=6 отдаёт HTTP 500).
+# Ответ: JSON с рядами за текущие сутки по времени контроллера:
+#   {"t_outdoor": [[мин, °C], ...], "t_indoor": ..., "t_water_supply": ..., "t_water_return": ...,
+#    "t_freon_supply": ..., "t_freon_return": ..., "axis": [[мин, подпись], ...]}
+# x — минуты от 00:00; шаг у живого getdata 1 мин, у сохранённой страницы ~5,5 мин (259 точек). Это те же данные, что страница
+# service.temzit.ru/stats (там они зашиты в InitData). Ряды t_hot_water/t_hot_water2 бывают не у всех.
+STATS_SERIES = ('t_outdoor', 't_indoor', 't_water_supply', 't_water_return',
+                't_freon_supply', 't_freon_return', 't_hot_water', 't_hot_water2')
+# Компрессор считаем работающим, когда подача теплее обратки и фреон горячий (по дампам 20–21.10.2026:
+# работа — ΔT 4–6 К при фреоне 50–56 °C; простой — ΔT < 0 при фреоне ~ температуре воды).
+COMP_ON_DT = 1.5
+COMP_ON_FREON = 45.0
+
+
+SITE_URL = 'https://service.temzit.ru'
+# Вход на сайт (проверено curl 2026-10-26): сначала GET /login — сервер выдаёт куку сессии; затем POST
+# /login с этой кукой (поля usrLogin, usrPassw, logmein=sign-in, CSRF нет) → 302 на /status, и сессия
+# становится авторизованной. POST без предварительного GET или на корень сайта сессию НЕ даёт.
+LOGIN_PATH = '/login'
+
+
+def _parse_stats(text: str) -> dict:
+    import json
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise CloudError('ответ графиков не JSON (сессия не принята?)') from None
+    if not isinstance(data, dict) or 't_outdoor' not in data or 't_water_supply' not in data:
+        raise CloudError('в ответе графиков нет рядов')
+    return data
+
+
+def get_stats(login, serial, password, timeout=20) -> dict:
+    """Ряды графиков за текущие сутки. Через API (cmd=6 с логином в адресе) сервер отвечает
+    HTTP 500 (проверено 2026-10-26), поэтому делаем как браузер: вход формой → кука сессии →
+    GET /stats/getdata. serial не нужен: статистика привязана к учётной записи."""
+    import http.cookiejar
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    ua = {'User-Agent': 'Mozilla/5.0 (temzit-addon)'}
+    body = urllib.parse.urlencode({'usrLogin': login, 'usrPassw': password, 'logmein': 'sign-in'}).encode()
+    try:
+        with opener.open(urllib.request.Request(SITE_URL + LOGIN_PATH, headers=ua), timeout=timeout) as r:
+            r.read()                                   # кука сессии
+        req = urllib.request.Request(SITE_URL + LOGIN_PATH, data=body, method='POST',
+                                     headers={**ua, 'Content-Type': 'application/x-www-form-urlencoded',
+                                              'Referer': SITE_URL + LOGIN_PATH})
+        with opener.open(req, timeout=timeout) as r:   # 302 → /status; urllib проходит редирект сам
+            r.read()
+        req = urllib.request.Request(SITE_URL + '/stats/getdata',
+                                     headers={**ua, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json'})
+        with opener.open(req, timeout=timeout) as r:
+            final = r.geturl()
+            text = r.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        raise CloudError(f'HTTP {e.code}: {HTTP_ERRORS.get(e.code, "ошибка связи")}') from None
+    except urllib.error.URLError as e:
+        raise CloudError(f'нет связи с сервером: {e.reason}') from None
+    except Exception as e:
+        raise CloudError(f'ошибка запроса: {type(e).__name__}') from None
+    if '/login' in final:
+        raise CloudError('вход на сайт не принят (неверный логин/пароль?)')
+    return _parse_stats(text)
+
+
+def _points(day: dict, x_from: int, x_to: int, x_shift: int = 0) -> list:
+    """Точки [x, out, in, sup, ret, frs] для x в [x_from, x_to) с общим сдвигом x (для сшивки суток)."""
+    cols = [dict(day.get(k) or []) for k in ('t_outdoor', 't_indoor', 't_water_supply', 't_water_return', 't_freon_supply')]
+    out = []
+    for x in sorted(cols[0]):
+        if x_from <= x < x_to:
+            out.append([x + x_shift] + [c.get(x) for c in cols])
+    return out
+
+
+def _summarize(points: list) -> dict:
+    """Сводка по точкам: доля времени работы компрессора, средние подача/обратка/ΔT при работе,
+    Тдом в начале/конце и её изменение, средняя улица."""
+    def mean(v):
+        v = [a for a in v if a is not None]
+        return round(sum(v) / len(v), 1) if v else None
+    on = [p for p in points if p[3] is not None and p[4] is not None and p[5] is not None
+          and (p[3] - p[4]) > COMP_ON_DT and p[5] > COMP_ON_FREON]
+    ins = [p[2] for p in points if p[2] is not None]
+    # Шаг между точками (мин) — у живого /stats/getdata 1 мин, у сохранённой страницы ~5,5 мин.
+    step = (points[-1][0] - points[0][0]) / (len(points) - 1) if len(points) > 1 else 0
+    return {
+        'points': len(points),
+        'step_min': round(step, 1),
+        'hours': round(len(points) * step / 60, 1) if points else 0,
+        'compressor_duty': round(100.0 * len(on) / len(points)) if points else None,
+        'compressor_hours': round(len(on) * step / 60, 1) if points else None,
+        't_supply_on': mean([p[3] for p in on]), 't_return_on': mean([p[4] for p in on]),
+        'dt_on': mean([p[3] - p[4] for p in on]),
+        't_indoor_start': ins[0] if ins else None, 't_indoor_end': ins[-1] if ins else None,
+        't_indoor_delta': round(ins[-1] - ins[0], 1) if ins else None,
+        't_indoor_min': min(ins) if ins else None, 't_indoor_max': max(ins) if ins else None,
+        't_outdoor_mean': mean([p[1] for p in points]),
+    }
+
+
+def night_summary(prev_day, day: dict, start_h: int = 23, end_h: int = 5) -> dict:
+    """Сводка ночи start_h (вчера) … end_h (сегодня): вчерашние точки с x ≥ start_h*60 плюс
+    сегодняшние с x < end_h*60. Без вчерашних данных — только сегодняшняя часть (hours покажет)."""
+    pts = []
+    if prev_day:
+        pts += _points(prev_day, start_h * 60, 1440, x_shift=-1440)
+    pts += _points(day, 0, end_h * 60)
+    s = _summarize(pts)
+    s.update({'window': f'{start_h:02d}:00–{end_h:02d}:00', 'has_prev_day': bool(prev_day)})
+    return s
+
+
+def day_summary(day: dict) -> dict:
+    """Сводка за сутки целиком."""
+    return _summarize(_points(day, 0, 1440))

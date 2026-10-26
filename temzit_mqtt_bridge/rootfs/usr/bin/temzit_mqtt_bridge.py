@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-Temzit MQTT Bridge v0.12.0 (CLOUD/LOCAL MODE SWITCH)
+Temzit MQTT Bridge v0.13.0 (CLOUD STATS)
+Изменения 0.13.0: статистика насоса из облака (/stats/getdata под сессией сайта, т.к. API cmd=6
+отдаёт HTTP 500 — те же ряды, что на странице графиков:
+улица, Тдом, подача, обратка, фреон; точка раз в ~5,5 мин). Два раза в сутки (05:10 и 23:58)
+аддон забирает ряды за текущие сутки и сохраняет в data_dir/stats/stats_ГГГГ-ММ-ДД.json. Утром
+публикует сводку прошедшей ночи 23:00–05:00 (sensor.temzit_cloud_night_stats: доля времени работы
+компрессора, подача/обратка при работе, Тдом в начале и конце ночи), вечером — сводку суток
+(sensor.temzit_cloud_day_stats). Это данные для подбора кривой автопилота HA.
+
 Изменения 0.12.0: переключатель switch.temzit_cloud_mode «Облачный режим». Выключен — аддон не
 обращается к облаку, облачные сущности недоступны (availability temzit/cloud/availability),
 облачные команды отклоняются. Выбор хранится в data_dir/cloud_mode.json.
@@ -115,6 +123,8 @@ CLOUD_INTERVAL = max(300, int(os.getenv('TEMZIT_CLOUD_INTERVAL', '1800') or 1800
 CLOUD_ENABLED = bool(CLOUD_LOGIN and CLOUD_SERIAL and CLOUD_PASS)
 # Запись через облако — отдельный выключатель (по умолчанию выключено) и только при включённом модуле.
 CLOUD_WRITE = CLOUD_ENABLED and os.getenv('TEMZIT_CLOUD_WRITE', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+# Моменты суточной выгрузки статистики (cmd=6): утром — сводка прошедшей ночи, вечером — полные сутки.
+CLOUD_STATS_TIMES = ((5, 10), (23, 58))
 CLOUD_WRITE_DEBOUNCE = 3.0      # с: изменения за это время уходят одной отправкой формы
 CLOUD_RECHECK_AFTER = 150       # с: повторное чтение после записи (ГМ забирает изменения раз в ~1 мин)
 CLOUD_WRITE_NUMBERS = (('P15', 'Темзит Гистерезис отопления (облако)'),
@@ -138,7 +148,7 @@ CLOUD_SENSORS = [
     ('P61', 'Темзит СК дельта включения', '°C'), ('P62', 'Темзит СК дельта выключения', '°C'),
     ('P64', 'Темзит СК перегрев БКН', '°C'),
 ]
-VERSION = '0.12.0'
+VERSION = '0.13.0'
 
 CMD_SYNC = 0x30
 CMD_REQCFG = 0x34
@@ -930,6 +940,13 @@ class Bridge:
             self._discover('sensor', key, {
                 'name': f'Темзит Расписание {n}', 'uniq_id': key, 'obj_id': key, 'device': device,
                 'stat_t': f'{base}/schedule/{n}', 'json_attr_t': f'{base}/schedule/{n}/attr', **avty})
+        for key, name in (('temzit_cloud_night_stats', 'Темзит Ночь: компрессор'),
+                          ('temzit_cloud_day_stats', 'Темзит Сутки: компрессор')):
+            part = key.split('_')[2]
+            self._discover('sensor', key, {
+                'name': name, 'uniq_id': key, 'obj_id': key, 'device': device, 'unit_of_meas': '%',
+                'icon': 'mdi:chart-timeline-variant',
+                'stat_t': f'{base}/stats/{part}', 'json_attr_t': f'{base}/stats/{part}/attr', **avty})
         self._discover('sensor', 'temzit_cloud_status', {
             'name': 'Темзит Облако', 'uniq_id': 'temzit_cloud_status', 'obj_id': 'temzit_cloud_status',
             'device': device, 'stat_t': f'{base}/status', 'json_attr_t': f'{base}/status/attr'})
@@ -1054,6 +1071,87 @@ class Bridge:
             self._cloud_refresh()          # в локальном режиме сразу выходит
             self._cloud_wake.wait(CLOUD_INTERVAL)
             self._cloud_wake.clear()
+
+    # ---- статистика (cmd=6) -------------------------------------------------------------
+    def _stats_dir(self):
+        if not self.backup_dir:
+            self.backup_dir = resolve_writable_dir(TEMZIT_DATA_DIR)
+        if not self.backup_dir:
+            return None
+        d = os.path.join(self.backup_dir, 'stats')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _stats_load(self, date):
+        d = self._stats_dir()
+        if not d:
+            return None
+        try:
+            with open(os.path.join(d, f'stats_{date.isoformat()}.json'), encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _stats_publish_night(self, today):
+        """Сводка ночи 23:00 (вчера) – 05:00 (сегодня) по сохранённым файлам."""
+        day = self._stats_load(today)
+        if not day:
+            return False
+        prev = self._stats_load(today - datetime.timedelta(days=1))
+        summ = temzit_cloud.night_summary(prev, day)
+        summ['date'] = today.isoformat()
+        base = f'{MQTT_PREFIX}/cloud/stats'
+        self.publish(f'{base}/night', summ['compressor_duty'] if summ['compressor_duty'] is not None else 'unknown')
+        self.publish(f'{base}/night/attr', summ)
+        return True
+
+    def _stats_fetch(self, morning: bool):
+        if not self.cloud_on:
+            return
+        today = datetime.date.today()
+        base = f'{MQTT_PREFIX}/cloud/stats'
+        with self._cloud_io:
+            try:
+                data = temzit_cloud.get_stats(CLOUD_LOGIN, CLOUD_SERIAL, CLOUD_PASS)
+            except Exception as e:
+                print(f'Cloud stats ERROR: {e}', flush=True)
+                self.publish(f'{MQTT_PREFIX}/bridge/error', {'cloud_stats_error': str(e)}, retain=False)
+                return
+        d = self._stats_dir()
+        if d:
+            with open(os.path.join(d, f'stats_{today.isoformat()}.json'), 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        n = len(data.get('t_outdoor') or [])
+        if morning:
+            self._stats_publish_night(today)
+            print(f'Cloud stats: утро, {n} точек, сводка ночи опубликована', flush=True)
+        else:
+            summ = temzit_cloud.day_summary(data)
+            summ['date'] = today.isoformat()
+            self.publish(f'{base}/day', summ['compressor_duty'] if summ['compressor_duty'] is not None else 'unknown')
+            self.publish(f'{base}/day/attr', summ)
+            print(f'Cloud stats: вечер, {n} точек, файл за {today} сохранён', flush=True)
+
+    def _stats_loop(self):
+        # После запуска — сразу опубликовать сводку прошедшей ночи из уже сохранённых файлов (если есть).
+        try:
+            self._stats_publish_night(datetime.date.today())
+        except Exception as e:
+            print(f'Cloud stats: не удалось восстановить сводку: {e}', flush=True)
+        while True:
+            now = datetime.datetime.now()
+            candidates = []
+            for h, m in CLOUD_STATS_TIMES:
+                t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if t <= now:
+                    t += datetime.timedelta(days=1)
+                candidates.append((t, h < 12))
+            t_next, morning = min(candidates)
+            time.sleep(max(1, (t_next - datetime.datetime.now()).total_seconds()))
+            try:
+                self._stats_fetch(morning)
+            except Exception as e:
+                print(f'Cloud stats: ошибка: {e}', flush=True)
 
     def _handle_cloud_cmd(self, topic, payload):
         if not CLOUD_WRITE:
@@ -1213,6 +1311,7 @@ class Bridge:
             self._publish_cloud_mode()
             print(f'Cloud mode: {"облачный" if self.cloud_on else "локальный"}', flush=True)
             threading.Thread(target=self._cloud_loop, daemon=True).start()
+            threading.Thread(target=self._stats_loop, daemon=True).start()
         else:
             print('Cloud: выключен (cloud_login/cloud_serial/cloud_password не заданы)', flush=True)
         while True:
